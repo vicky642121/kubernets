@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pgsql-pod
+  labels:
+    app: pgsql
+spec:
+  containers:
+    - name: pgsql-container
+      image: postgres:13
+      imagePullPolicy: IfNotPresent
+      env:
+        - name: POSTGRES_USER
+          value: "postgres"
+        - name: POSTGRES_PASSWORD
+          value: "Cloud@123"
+        - name: POSTGRES_DB
+          value: "k8_learning"
+      ports:
+        - containerPort: 5432

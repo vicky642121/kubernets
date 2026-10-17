@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: frontend-pod
+  labels:
+    app: frontend
+spec:
+  containers:
+    - name: frontend-container
+      image: k8-frontend:dev
+      imagePullPolicy: IfNotPresent
+      tty: true
+      # args: ["--","--host", "0.0.0.0"]
+      ports:
+        - containerPort: 5173 
