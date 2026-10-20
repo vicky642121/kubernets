@@ -1,6 +1,6 @@
 # Docker & Kubernetes Learning Journal
 
-A beginner's journal of learning **Docker** and **Kubernetes (Minikube)** by running a small three-part app (React frontend, Node.js backend, PostgreSQL database) as plain Pods on a local cluster.
+A beginner's journal of learning **Docker** and **Kubernetes (Minikube)** by running a small three-part app (React frontend, Node.js backend, PostgreSQL database) as plain Pods first, and now as **Deployments**, on a local cluster.
 
 > **About accuracy:** The files and commands below come from my own project and practice. Parts that are general background (for example, the architecture section) are explained from standard Kubernetes concepts. Where something is a known weakness in my setup, I say so. Output samples are illustrative, not pasted from a verified run.
 
@@ -14,6 +14,7 @@ A beginner's journal of learning **Docker** and **Kubernetes (Minikube)** by run
 4. [Building and loading images](#4-building-and-loading-images)
 5. [Minikube setup (Ubuntu)](#5-minikube-setup-ubuntu)
 6. [Pod YAML files explained line by line](#6-pod-yaml-files-explained-line-by-line)
+   - [6b. Deployment YAML files (Pod → Deployment)](#6b-deployment-yaml-files-pod--deployment)
 7. [Commands explained](#7-commands-explained)
 8. [Kubernetes architecture: control plane and worker nodes](#8-kubernetes-architecture-control-plane-and-worker-nodes)
 9. [Frontend, backend and PostgreSQL communication](#9-frontend-backend-and-postgresql-communication)
@@ -67,12 +68,15 @@ kubernetsLearning/
 │   │   └── seeders/001_seed_products.sql        # inserts 3 sample rows
 │   └── kubernetes/
 │       ├── Backend-pod.yaml
-│       └── Pgsql-pod.yaml
+│       ├── Backend-deployment.yaml      # backend + postgres sidecar
+│       ├── Pgsql-pod.yaml
+│       └── Pgsql-deployment.yaml        # standalone DB (not used, see 6b)
 ├── FrontEnd/
 │   ├── Dockerfile                       # recipe for k8-frontend:dev
 │   ├── src/App.jsx                      # fetches the products
 │   └── kubernetes/
-│       └── Frontend-pod.yaml
+│       ├── Frontend-pod.yaml
+│       └── Frontend-deployment.yaml
 └── PythonBackEnd/                       # separate FastAPI experiment (not in K8s)
 ```
 
@@ -499,6 +503,176 @@ These are read by the official `postgres` image the **first time** it starts wit
 
 ---
 
+## 6b. Deployment YAML files (Pod → Deployment)
+
+A bare Pod is never recreated if it dies. A **Deployment** fixes that: it describes the Pod I want (a *template*) and how many copies (*replicas*). A controller then keeps that many Pods running, recreates them if they crash or are deleted, and handles rolling updates.
+
+```text
+Deployment  →  ReplicaSet  →  Pod(s)  →  container(s)
+```
+
+I now have three Deployment files next to the Pod files:
+
+| File | Deployment name | What it runs |
+|------|-----------------|--------------|
+| `FrontEnd/kubernetes/Frontend-deployment.yaml` | `frontend-deployment` | `vigneshpandianv/k8-frontend:dev` on 5173 |
+| `BackEnd/kubernetes/Backend-deployment.yaml` | `backend-deployment` | **two containers in one Pod**: the backend + `postgres:13` |
+| `BackEnd/kubernetes/Pgsql-deployment.yaml` | `pgsql-deployment` | `postgres:13` alone (not used, see below) |
+
+### 6b.1 Frontend Deployment
+
+```yaml
+apiVersion: apps/v1          # Deployments live in the "apps/v1" API group (Pods are plain "v1")
+kind: Deployment
+metadata:
+  name: frontend-deployment  # name of the Deployment itself
+  labels:
+    app: frontend            # label on the Deployment object
+spec:
+  replicas: 1                # how many Pods to keep running
+  selector:
+    matchLabels:
+      app: frontend          # "manage Pods that have this label"
+  template:                  # the Pod blueprint, same content as a Pod's metadata + spec
+    metadata:
+      labels:
+        app: frontend        # MUST match selector.matchLabels
+    spec:
+      containers:
+        - name: frontend-container
+          image: vigneshpandianv/k8-frontend:dev
+          imagePullPolicy: IfNotPresent
+          tty: true
+          ports:
+            - containerPort: 5173
+```
+
+**What's new compared with a Pod file:**
+
+| Field | Meaning |
+|-------|---------|
+| `kind: Deployment`, `apiVersion: apps/v1` | The object type and its API group. |
+| `spec.replicas` | Desired number of Pods. Change to `3` and apply to scale. |
+| `spec.selector.matchLabels` | How the Deployment finds the Pods it owns. |
+| `spec.template` | Everything under it is the old Pod YAML (`metadata.labels` + `spec.containers`). |
+| Label match rule | `selector.matchLabels` **must equal** `template.metadata.labels`, otherwise `apply` is rejected. |
+| Pod names | Generated: `frontend-deployment-<replicaset-hash>-<random>`. You no longer pick the Pod name. |
+
+### 6b.2 Backend Deployment (backend + PostgreSQL in one Pod)
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend-deployment
+  labels:
+    app: backend
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: backend
+  template:
+    metadata:
+      labels:
+        app: backend
+    spec:
+      containers:
+        - name: backend-container
+          image: vigneshpandianv/k8-backend:v2
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 3000
+          env:
+            - name: DB_HOST
+              value: "127.0.0.1"          # same Pod = same network, so localhost works
+            - name: DB_PORT
+              value: "5432"
+            - name: DB_USER
+              value: "postgres"
+            - name: DB_PASSWORD
+              value: "<YOUR_PASSWORD>"
+            - name: DB_NAME
+              value: "k8_learning"
+        - name: pgsql-container           # second container in the SAME Pod
+          image: postgres:13
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: POSTGRES_USER
+              value: "postgres"
+            - name: POSTGRES_PASSWORD
+              value: "<YOUR_PASSWORD>"
+            - name: POSTGRES_DB
+              value: "k8_learning"
+          ports:
+            - containerPort: 5432
+```
+
+**Why PostgreSQL is inside the backend Deployment.** With separate Pods, the database Pod gets a new IP every time it is recreated, so a hard-coded `DB_HOST` breaks (the weakness in [section 9](#9-frontend-backend-and-postgresql-communication)). Containers in the **same Pod share one network namespace**, so the backend reaches PostgreSQL on `127.0.0.1:5432`. That is why `Pgsql-deployment.yaml` (a standalone DB Deployment) isn't used: its Pod IP would change. It has a comment saying so.
+
+**Trade-offs of this shortcut** (fine for learning, not for real systems):
+
+- The DB and the backend live and die together, so `replicas: 2` would give two *separate, empty* databases.
+- There is no volume, so the data is lost whenever the Pod is recreated.
+- The proper fix is a separate PostgreSQL Deployment plus a **Service** (stable name) and a PersistentVolumeClaim. Those are next on my list.
+
+### 6b.3 Commands for Deployments
+
+```bash
+kubectl apply -f BackEnd/kubernetes/Backend-deployment.yaml
+kubectl apply -f FrontEnd/kubernetes/Frontend-deployment.yaml
+
+kubectl get deployments                       # READY shows 1/1 when the Pod is up
+kubectl get pods -l app=backend               # Pods owned by the backend Deployment
+kubectl describe deployment backend-deployment
+kubectl logs deploy/backend-deployment -c backend-container   # -c is needed: 2 containers
+kubectl scale deployment frontend-deployment --replicas=3
+kubectl rollout status deployment backend-deployment
+kubectl rollout undo deployment backend-deployment            # go back one version
+kubectl delete -f BackEnd/kubernetes/Backend-deployment.yaml
+```
+
+**Self-healing demo:** delete the Pod and watch a new one appear.
+
+```bash
+kubectl delete pod -l app=frontend
+kubectl get pods -w          # a new frontend-deployment-... Pod is created automatically
+```
+
+### 6b.4 Loading data into the PostgreSQL container
+
+Pod names are generated now, so look the name up first and choose the container with `-c`:
+
+```bash
+POD=$(kubectl get pod -l app=backend -o jsonpath='{.items[0].metadata.name}')
+
+# Create the table
+kubectl exec -i $POD -c pgsql-container -- psql -U postgres -d k8_learning \
+  < BackEnd/database/migrations/001_create_products.sql
+
+# Insert the 3 sample rows
+kubectl exec -i $POD -c pgsql-container -- psql -U postgres -d k8_learning \
+  < BackEnd/database/seeders/001_seed_products.sql
+
+# Check
+kubectl exec -it $POD -c pgsql-container -- psql -U postgres -d k8_learning -c "SELECT * FROM products;"
+```
+
+Run these again after the Pod is recreated, because the data is not persistent.
+
+### Pod vs Deployment
+
+| | Pod | Deployment |
+|---|-----|-----------|
+| Recreated if it dies | No | Yes |
+| Scale to N copies | No | `replicas: N` |
+| Rolling update / rollback | No | Yes |
+| Pod name | You choose | Generated |
+| Delete Pod by name | Gone for good | Replaced by a new one |
+| To stop it | `kubectl delete pod x` | `kubectl delete deployment x` (deleting the Pod just recreates it) |
+
+---
+
 ## 7. Commands explained
 
 > Commands are listed from my practice. I have not re-run each one while writing this README, so treat sample outputs as examples.
@@ -765,6 +939,8 @@ kubectl apply -f BackEnd/kubernetes/Backend-pod.yaml
 - Why local images must be loaded into Minikube (`minikube image load`).
 - Writing Pod YAML for a frontend, a backend and PostgreSQL.
 - Passing configuration with `env`.
+- Writing Deployment YAML (`replicas`, `selector`, `template`), and how a Deployment recreates Pods and manages replicas.
+- Running PostgreSQL as a second container in the backend Pod so the backend can use `127.0.0.1`, and loading data with `kubectl exec -c pgsql-container`.
 - Managing Pods with `kubectl apply`, `get`, `describe`, `logs`, `exec`, `delete`.
 - Diagnosing `ErrImagePull` and `ImagePullBackOff`.
 - Setting up a basic PostgreSQL database and pointing the backend at it.
@@ -776,7 +952,7 @@ kubectl apply -f BackEnd/kubernetes/Backend-pod.yaml
 These are **not done yet**; they are my to-do list.
 
 - [ ] **Services**: stable names/addresses so the backend doesn't need a hard-coded Pod IP, and a proper way to reach the frontend and backend.
-- [ ] **Deployments**: self-healing Pods, replicas, rolling updates.
+- [x] **Deployments**: self-healing Pods, replicas, rolling updates (basics done, see [6b](#6b-deployment-yaml-files-pod--deployment)).
 - [ ] **ConfigMaps**: move non-secret settings out of the Pod YAML.
 - [ ] **Secrets**: store the database password safely.
 - [ ] **Persistent storage** (PersistentVolume / PersistentVolumeClaim): keep PostgreSQL data across Pod restarts.

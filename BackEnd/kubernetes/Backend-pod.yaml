@@ -8,13 +8,13 @@ spec:
   hostNetwork: true
   containers:
     - name: backend-container
-      image: k8-backend:v1
+      image: vigneshpandianv/k8-backend
       imagePullPolicy: IfNotPresent
       ports:
         - containerPort: 3000
       env:
         - name: DB_HOST
-          value: "10.244.0.4"
+          value: "10.244.0.9"
         - name: DB_PORT
           value: "5432"
         - name: DB_USER
