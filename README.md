@@ -1,6 +1,6 @@
 # Docker & Kubernetes Learning Journal
 
-A beginner's journal of learning **Docker** and **Kubernetes (Minikube)** by running a small three-part app (React frontend, Node.js backend, PostgreSQL database) as plain Pods first, and now as **Deployments**, on a local cluster.
+A beginner's journal of learning **Docker** and **Kubernetes (Minikube)** by running a small three-part app (React frontend, Node.js backend, PostgreSQL database) as plain Pods first, then as **Deployments** with **Services**, on a local cluster.
 
 > **About accuracy:** The files and commands below come from my own project and practice. Parts that are general background (for example, the architecture section) are explained from standard Kubernetes concepts. Where something is a known weakness in my setup, I say so. Output samples are illustrative, not pasted from a verified run.
 
@@ -15,6 +15,7 @@ A beginner's journal of learning **Docker** and **Kubernetes (Minikube)** by run
 5. [Minikube setup (Ubuntu)](#5-minikube-setup-ubuntu)
 6. [Pod YAML files explained line by line](#6-pod-yaml-files-explained-line-by-line)
    - [6b. Deployment YAML files (Pod → Deployment)](#6b-deployment-yaml-files-pod--deployment)
+   - [6c. Service YAML files](#6c-service-yaml-files)
 7. [Commands explained](#7-commands-explained)
 8. [Kubernetes architecture: control plane and worker nodes](#8-kubernetes-architecture-control-plane-and-worker-nodes)
 9. [Frontend, backend and PostgreSQL communication](#9-frontend-backend-and-postgresql-communication)
@@ -69,6 +70,7 @@ kubernetsLearning/
 │   └── kubernetes/
 │       ├── Backend-pod.yaml
 │       ├── Backend-deployment.yaml      # backend + postgres sidecar
+│       ├── Backend-service.yaml         # ClusterIP, port 3000
 │       ├── Pgsql-pod.yaml
 │       └── Pgsql-deployment.yaml        # standalone DB (not used, see 6b)
 ├── FrontEnd/
@@ -76,7 +78,8 @@ kubernetsLearning/
 │   ├── src/App.jsx                      # fetches the products
 │   └── kubernetes/
 │       ├── Frontend-pod.yaml
-│       └── Frontend-deployment.yaml
+│       ├── Frontend-deployment.yaml
+│       └── Frontend-service.yaml        # ClusterIP, 8080 → 5173
 └── PythonBackEnd/                       # separate FastAPI experiment (not in K8s)
 ```
 
@@ -673,6 +676,128 @@ Run these again after the Pod is recreated, because the data is not persistent.
 
 ---
 
+## 6c. Service YAML files
+
+Pod IPs change every time a Pod is recreated, so nothing should depend on them. A **Service** gives a group of Pods one **stable IP and DNS name**, and load-balances across them. It finds its Pods with a **label selector**, the same labels my Deployments put on their Pods.
+
+```text
+client → Service (stable name + ClusterIP) → selector app=backend → Pod(s) (IPs may change)
+```
+
+I have two Services:
+
+| File | Service name | Type | Port → targetPort | Selects Pods with |
+|------|--------------|------|-------------------|-------------------|
+| `BackEnd/kubernetes/Backend-service.yaml` | `backend-service` | `ClusterIP` | 3000 → 3000 | `app: backend` |
+| `FrontEnd/kubernetes/Frontend-service.yaml` | `frontend-service` | `ClusterIP` (default) | 8080 → 5173 | `app: frontend` |
+
+### 6c.1 Backend Service
+
+```yaml
+apiVersion: v1                # Services are in the core "v1" group
+kind: Service
+metadata:
+  name: backend-service       # becomes the DNS name inside the cluster
+  labels:
+    app: backend              # label on the Service object itself (not used for routing)
+spec:
+  type: ClusterIP             # reachable only from inside the cluster
+  selector:
+    app: backend              # send traffic to Pods that have this label
+  ports:
+    - port: 3000              # port the Service listens on
+      targetPort: 3000        # port on the Pod's container to forward to
+      protocol: TCP
+```
+
+### 6c.2 Frontend Service
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend-service
+  labels:
+    app: frontend
+spec:
+  selector:
+    app: frontend
+  ports:
+    - protocol: TCP
+      port: 8080              # Service port (what clients use)
+      targetPort: 5173        # Vite dev server port in the container
+```
+
+There is no `type:`, so it defaults to `ClusterIP`.
+
+### Field-by-field
+
+| Field | Meaning |
+|-------|---------|
+| `selector` | Which Pods receive traffic. It must match the **Pod** labels (`template.metadata.labels` in the Deployment), not the Deployment's own labels. If nothing matches, the Service has no endpoints. |
+| `port` | The port the **Service** exposes. |
+| `targetPort` | The port the **container** listens on (`containerPort`). It can differ from `port`, as in the frontend (8080 → 5173). |
+| `protocol` | `TCP` (default). |
+| `type` | How the Service is exposed (below). |
+
+### Service types
+
+| Type | Reachable from | Use |
+|------|----------------|-----|
+| `ClusterIP` (default) | Inside the cluster only | Pod-to-pod traffic, e.g. frontend → backend. |
+| `NodePort` | Outside, at `<node-ip>:<30000-32767>` | Simple access from my machine. |
+| `LoadBalancer` | Outside, via a cloud load balancer (on Minikube: `minikube tunnel`) | Cloud setups. |
+
+Both my Services are `ClusterIP`, so they can't be opened from my browser directly. I use `kubectl port-forward` for testing (below). `NodePort` or Ingress is what's needed for real outside access.
+
+### 6c.3 Commands for Services
+
+```bash
+kubectl apply -f BackEnd/kubernetes/Backend-service.yaml
+kubectl apply -f FrontEnd/kubernetes/Frontend-service.yaml
+
+kubectl get svc                          # shows CLUSTER-IP and PORT(S)
+kubectl describe svc backend-service     # check the Endpoints line
+kubectl get endpoints backend-service    # the Pod IP:port the Service points at
+
+# Reach a ClusterIP Service from my machine (keep the terminal open)
+kubectl port-forward svc/backend-service 3000:3000
+curl http://localhost:3000/api/products
+
+kubectl port-forward svc/frontend-service 8080:8080
+# then open http://localhost:8080
+```
+
+**Test the DNS name from inside the cluster:**
+
+```bash
+kubectl run curl-test --rm -it --image=curlimages/curl --restart=Never -- \
+  curl http://backend-service:3000/health
+```
+
+Inside the cluster, `backend-service` resolves to the Service IP. The full name is `backend-service.<namespace>.svc.cluster.local` (here `backend-service.default.svc.cluster.local`).
+
+### How a Service fixes the IP problem
+
+- The Service IP stays the same while the Pod IP changes. Delete the backend Pod and a new one gets a new IP, but `backend-service` still works.
+- `kubectl describe svc` shows `Endpoints:`. If it says `<none>`, the selector doesn't match any ready Pod. Compare `kubectl get pods --show-labels` with the `selector`.
+- Services also load-balance: with `replicas: 3` the traffic is spread across the 3 Pods.
+
+### Where I still use `127.0.0.1`
+
+The backend still reaches PostgreSQL on `127.0.0.1` because PostgreSQL is a container **inside the backend Pod** (see [6b.2](#6b2-backend-deployment-backend--postgresql-in-one-pod)). A Service isn't needed for that. When I split PostgreSQL into its own Deployment, I will put a `pgsql-service` in front of it and set `DB_HOST: pgsql-service`.
+
+### Common Service problems
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| `Endpoints: <none>` | Selector doesn't match the Pod labels. | Fix `selector` or the Pod template labels. |
+| Connection refused through the Service | `targetPort` is not the port the app listens on. | Match `targetPort` to the container port (3000 / 5173). |
+| Can't open the Service in the browser | It is `ClusterIP`. | Use `port-forward`, or change to `NodePort` (`minikube service frontend-service --url`). |
+| Works by Pod IP, not by name | Wrong Service name or namespace. | `kubectl get svc`, and use the exact name. |
+
+---
+
 ## 7. Commands explained
 
 > Commands are listed from my practice. I have not re-run each one while writing this README, so treat sample outputs as examples.
@@ -940,6 +1065,7 @@ kubectl apply -f BackEnd/kubernetes/Backend-pod.yaml
 - Writing Pod YAML for a frontend, a backend and PostgreSQL.
 - Passing configuration with `env`.
 - Writing Deployment YAML (`replicas`, `selector`, `template`), and how a Deployment recreates Pods and manages replicas.
+- Writing Service YAML (`selector`, `port`, `targetPort`, `type`), the Service types, DNS names, and testing with `port-forward`.
 - Running PostgreSQL as a second container in the backend Pod so the backend can use `127.0.0.1`, and loading data with `kubectl exec -c pgsql-container`.
 - Managing Pods with `kubectl apply`, `get`, `describe`, `logs`, `exec`, `delete`.
 - Diagnosing `ErrImagePull` and `ImagePullBackOff`.
@@ -951,7 +1077,8 @@ kubectl apply -f BackEnd/kubernetes/Backend-pod.yaml
 
 These are **not done yet**; they are my to-do list.
 
-- [ ] **Services**: stable names/addresses so the backend doesn't need a hard-coded Pod IP, and a proper way to reach the frontend and backend.
+- [x] **Services**: stable names/addresses (`ClusterIP` done, see [6c](#6c-service-yaml-files)).
+- [ ] **NodePort / LoadBalancer Services** and a separate PostgreSQL Deployment with its own `pgsql-service`.
 - [x] **Deployments**: self-healing Pods, replicas, rolling updates (basics done, see [6b](#6b-deployment-yaml-files-pod--deployment)).
 - [ ] **ConfigMaps**: move non-secret settings out of the Pod YAML.
 - [ ] **Secrets**: store the database password safely.
