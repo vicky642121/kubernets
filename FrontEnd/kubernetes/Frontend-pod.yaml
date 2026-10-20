@@ -7,7 +7,7 @@ metadata:
 spec:
   containers:
     - name: frontend-container
-      image: k8-frontend:dev
+      image: vigneshpandianv/k8-frontend
       imagePullPolicy: IfNotPresent
       tty: true
       # args: ["--","--host", "0.0.0.0"]
