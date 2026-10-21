@@ -16,6 +16,7 @@ A beginner's journal of learning **Docker** and **Kubernetes (Minikube)** by run
 6. [Pod YAML files explained line by line](#6-pod-yaml-files-explained-line-by-line)
    - [6b. Deployment YAML files (Pod → Deployment)](#6b-deployment-yaml-files-pod--deployment)
    - [6c. Service YAML files](#6c-service-yaml-files)
+   - [6d. ConfigMap YAML file](#6d-configmap-yaml-file)
 7. [Commands explained](#7-commands-explained)
 8. [Kubernetes architecture: control plane and worker nodes](#8-kubernetes-architecture-control-plane-and-worker-nodes)
 9. [Frontend, backend and PostgreSQL communication](#9-frontend-backend-and-postgresql-communication)
@@ -783,9 +784,9 @@ Inside the cluster, `backend-service` resolves to the Service IP. The full name 
 - `kubectl describe svc` shows `Endpoints:`. If it says `<none>`, the selector doesn't match any ready Pod. Compare `kubectl get pods --show-labels` with the `selector`.
 - Services also load-balance: with `replicas: 3` the traffic is spread across the 3 Pods.
 
-### Where I still use `127.0.0.1`
+### Where I use a Service name instead of `127.0.0.1`
 
-The backend still reaches PostgreSQL on `127.0.0.1` because PostgreSQL is a container **inside the backend Pod** (see [6b.2](#6b2-backend-deployment-backend--postgresql-in-one-pod)). A Service isn't needed for that. When I split PostgreSQL into its own Deployment, I will put a `pgsql-service` in front of it and set `DB_HOST: pgsql-service`.
+In the Pod version, the backend reached PostgreSQL on `127.0.0.1` because PostgreSQL was a container **inside the backend Pod** (see [6b.2](#6b2-backend-deployment-backend--postgresql-in-one-pod)). I have now split PostgreSQL into its own Deployment (`Pgsql-deployment.yaml`) with its own `pgsql-service` (`Pgsql-service.yaml`, `ClusterIP`, port 5432), and the backend uses `DB_HOST: pgsql-service` from the ConfigMap (see [6d](#6d-configmap-yaml-file)).
 
 ### Common Service problems
 
@@ -795,6 +796,115 @@ The backend still reaches PostgreSQL on `127.0.0.1` because PostgreSQL is a cont
 | Connection refused through the Service | `targetPort` is not the port the app listens on. | Match `targetPort` to the container port (3000 / 5173). |
 | Can't open the Service in the browser | It is `ClusterIP`. | Use `port-forward`, or change to `NodePort` (`minikube service frontend-service --url`). |
 | Works by Pod IP, not by name | Wrong Service name or namespace. | `kubectl get svc`, and use the exact name. |
+
+---
+
+## 6d. ConfigMap YAML file
+
+### Why I use a ConfigMap
+
+At first I wrote the database settings straight into each Pod/Deployment under `env:`. That has problems:
+
+- The same values (`DB_HOST`, `DB_USER`, ...) were repeated in several files, and they get out of sync.
+- Changing one value meant editing the Deployment YAML itself.
+- The file grows messy as more settings are added.
+
+A **ConfigMap** is a separate Kubernetes object that holds key/value settings. Deployments just *refer* to it, so the settings live in **one place**. The app code stays the same, and the same image can run with different settings.
+
+```text
+Backend-config.yaml (ConfigMap)  ──►  Backend-deployment.yaml   (envFrom)
+                                 └─►  Pgsql-deployment.yaml     (env + configMapKeyRef)
+```
+
+### My ConfigMap (`BackEnd/kubernetes/Backend-config.yaml`)
+
+```yaml
+apiVersion: v1                # ConfigMap is in the core "v1" group
+kind: ConfigMap
+metadata:
+  name: backend-config        # the name other files use to refer to it
+data:                         # plain key: value pairs (all values are strings)
+  DB_HOST: "pgsql-service"    # the Service name of PostgreSQL, not an IP
+  DB_NAME: "k8_learning"
+  DB_PORT: "5432"
+  DB_USER: "postgres"
+  DB_PASSWORD: "Cloud@123"
+```
+
+### Using it in the backend: `envFrom`
+
+```yaml
+envFrom:
+  - configMapRef:
+      name: backend-config
+```
+
+`envFrom` turns **every key** in the ConfigMap into an environment variable with the **same name** (`DB_HOST`, `DB_PORT`, ...). This is what replaced the long `env:` list.
+
+### Using it in PostgreSQL: `configMapKeyRef`
+
+The official `postgres` image does **not** read `DB_USER` / `DB_PASSWORD` / `DB_NAME`. It only reads `POSTGRES_USER`, `POSTGRES_PASSWORD` and `POSTGRES_DB`. So here I pick single keys and give them the name Postgres expects:
+
+```yaml
+env:
+  - name: POSTGRES_USER
+    valueFrom:
+      configMapKeyRef:
+        name: backend-config   # which ConfigMap
+        key: DB_USER           # which key inside it
+  - name: POSTGRES_PASSWORD
+    valueFrom:
+      configMapKeyRef:
+        name: backend-config
+        key: DB_PASSWORD
+  - name: POSTGRES_DB
+    valueFrom:
+      configMapKeyRef:
+        name: backend-config
+        key: DB_NAME
+```
+
+| Way | Use it when |
+|-----|-------------|
+| `envFrom` + `configMapRef` | The variable names in the ConfigMap are already what the app wants (my backend). |
+| `env` + `valueFrom.configMapKeyRef` | I need one key only, or need a **different variable name** (PostgreSQL). |
+
+### The mistake I made
+
+First, `Pgsql-deployment.yaml` used `envFrom: backend-config`. The Postgres Pod crashed with:
+
+```text
+Database is uninitialized and superuser password is not specified.
+You must specify POSTGRES_PASSWORD to a non-empty value for the superuser.
+```
+
+**Cause:** the ConfigMap only has `DB_*` keys, so Postgres never got `POSTGRES_PASSWORD`. **Fix:** map the keys with `configMapKeyRef` as shown above. The lesson: `envFrom` copies names exactly, so the names in the ConfigMap must match what the container reads.
+
+### Important notes
+
+- **Create the ConfigMap first.** If a Pod refers to a ConfigMap that doesn't exist, it stays in `CreateContainerConfigError`.
+- **Changing a ConfigMap does not update running Pods.** Environment variables are read only when the container starts. After editing, run `kubectl apply -f Backend-config.yaml` and then `kubectl rollout restart deployment backend-deployment` (and the same for `pgsql-deployment`). *(I first thought no restart was needed. That is wrong for env variables.)*
+- **A ConfigMap is not secret.** The values are stored as plain text, so `DB_PASSWORD` should really go into a **Secret**. Keeping the password here is only for learning.
+- A changed `POSTGRES_PASSWORD` has no effect on a database that already exists on disk. It is only used when the database is first created.
+
+### Commands for ConfigMaps
+
+```bash
+kubectl apply -f BackEnd/kubernetes/Backend-config.yaml   # create / update
+kubectl get configmap                                      # list
+kubectl describe configmap backend-config                  # show the keys and values
+kubectl get configmap backend-config -o yaml               # full YAML
+kubectl exec deploy/backend-deployment -- env | grep DB_   # check what the Pod really received
+kubectl rollout restart deployment backend-deployment      # make Pods pick up changes
+```
+
+### How the pieces connect now
+
+```text
+backend Pod ──DB_HOST=pgsql-service──► pgsql-service (ClusterIP :5432) ──► pgsql Pod (postgres:13)
+      ▲                                                                         ▲
+      └──────────────── both read their settings from ConfigMap backend-config ─┘
+```
 
 ---
 
@@ -1072,16 +1182,21 @@ kubectl apply -f BackEnd/kubernetes/Backend-pod.yaml
 - Setting up a basic PostgreSQL database and pointing the backend at it.
 - The basic Kubernetes architecture (control plane, worker node) and the flow of a `kubectl apply`.
 - Why `localhost` doesn't reach other Pods, and why data disappears without persistent storage.
+- Writing a ConfigMap and why: one place for settings instead of repeating `env:` in every file ([6d](#6d-configmap-yaml-file)).
+- `envFrom` / `configMapRef` (copy all keys) vs `valueFrom` / `configMapKeyRef` (pick one key, rename it).
+- Splitting PostgreSQL into its own Deployment + `pgsql-service`, and seeding it with `kubectl exec -i deploy/pgsql-deployment -- psql ... < file.sql`.
+- Reading the `POSTGRES_PASSWORD` error: the Postgres image only understands `POSTGRES_*` variable names.
+- A ConfigMap change needs `kubectl rollout restart` to reach running Pods.
 
 ## 12. What I plan to learn next
 
 These are **not done yet**; they are my to-do list.
 
 - [x] **Services**: stable names/addresses (`ClusterIP` done, see [6c](#6c-service-yaml-files)).
-- [ ] **NodePort / LoadBalancer Services** and a separate PostgreSQL Deployment with its own `pgsql-service`.
+- [ ] **NodePort / LoadBalancer Services**. (A separate PostgreSQL Deployment with `pgsql-service` is done.)
 - [x] **Deployments**: self-healing Pods, replicas, rolling updates (basics done, see [6b](#6b-deployment-yaml-files-pod--deployment)).
-- [ ] **ConfigMaps**: move non-secret settings out of the Pod YAML.
-- [ ] **Secrets**: store the database password safely.
+- [x] **ConfigMaps**: move settings out of the Pod YAML (done, see [6d](#6d-configmap-yaml-file)).
+- [ ] **Secrets**: move `DB_PASSWORD` out of the ConfigMap, because a ConfigMap is plain text.
 - [ ] **Persistent storage** (PersistentVolume / PersistentVolumeClaim): keep PostgreSQL data across Pod restarts.
 - [ ] **Ingress**: route outside traffic to the frontend and backend.
 - [ ] Add a `.dockerignore`, and production-style images (no dev server).

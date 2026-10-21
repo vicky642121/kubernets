@@ -1,6 +1,8 @@
 ## I moved this configuration into the Backend-deployment.yaml file because if am put this separate deployment file ,
 ##pgsql pod port will be changing often, so that i cannot able to put port in the Backend-deployment.yaml file. same pod will be lisening "127.0.0.1" - so that i moved this to backend deployement.
 
+
+#again i am using this because i using service.yaml file so that again i am using this pgsql-deployment.yaml file to create a pod for pgsql and this pod will be listening on the same port 5432 so that i can able to connect with backend pod using service name "pgsql-service" and port 5432.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -23,10 +25,19 @@ spec:
           imagePullPolicy: IfNotPresent
           env:
             - name: POSTGRES_USER
-              value: "postgres"
+              valueFrom:
+                configMapKeyRef:
+                  name: backend-config
+                  key: DB_USER
             - name: POSTGRES_PASSWORD
-              value: "Cloud@123"
+              valueFrom:
+                configMapKeyRef:
+                  name: backend-config
+                  key: DB_PASSWORD
             - name: POSTGRES_DB
-              value: "k8_learning"
+              valueFrom:
+                configMapKeyRef:
+                  name: backend-config
+                  key: DB_NAME
           ports:
             - containerPort: 5432
