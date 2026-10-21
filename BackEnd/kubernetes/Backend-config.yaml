@@ -6,5 +6,5 @@ data:
   DB_HOST: "pgsql-service"
   DB_NAME: "k8_learning"
   DB_PORT: "5432"
-  DB_USER: "postgres"
-  DB_PASSWORD: "Cloud@123"
+  # DB_USER: "postgres"
+  # DB_PASSWORD: "Cloud@123" // i moved to the secret.yaml file because of the security reason. if i put the password in the configmap file then anyone can able to see the password because configmap is not secure. so i moved the password to secret.yaml file because secret is secure and only authorized person can able to see the secret values.

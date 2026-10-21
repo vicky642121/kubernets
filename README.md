@@ -17,6 +17,8 @@ A beginner's journal of learning **Docker** and **Kubernetes (Minikube)** by run
    - [6b. Deployment YAML files (Pod → Deployment)](#6b-deployment-yaml-files-pod--deployment)
    - [6c. Service YAML files](#6c-service-yaml-files)
    - [6d. ConfigMap YAML file](#6d-configmap-yaml-file)
+   - [6e. Secret YAML file](#6e-secret-yaml-file)
+   - [6f. Namespace YAML file](#6f-namespace-yaml-file)
 7. [Commands explained](#7-commands-explained)
 8. [Kubernetes architecture: control plane and worker nodes](#8-kubernetes-architecture-control-plane-and-worker-nodes)
 9. [Frontend, backend and PostgreSQL communication](#9-frontend-backend-and-postgresql-communication)
@@ -67,13 +69,19 @@ kubernetsLearning/
 │   │   └── routes/product.routes.js     # /api/products endpoints
 │   ├── database/
 │   │   ├── migrations/001_create_products.sql   # creates the table
-│   │   └── seeders/001_seed_products.sql        # inserts 3 sample rows
+│   │   └── seeders/001_seed_products.sql        # inserts 8 sample rows
 │   └── kubernetes/
 │       ├── Backend-pod.yaml
-│       ├── Backend-deployment.yaml      # backend + postgres sidecar
+│       ├── Backend-deployment.yaml      # backend; settings from ConfigMap + Secret
 │       ├── Backend-service.yaml         # ClusterIP, port 3000
+│       ├── Backend-config.yaml          # ConfigMap: DB_HOST, DB_PORT, DB_NAME (6d)
+│       ├── Backend-secret.yaml          # Secret: DB_USER, DB_PASSWORD (6e)
 │       ├── Pgsql-pod.yaml
-│       └── Pgsql-deployment.yaml        # standalone DB (not used, see 6b)
+│       ├── Pgsql-deployment.yaml        # standalone PostgreSQL Deployment (in use)
+│       ├── Pgsql-service.yaml           # ClusterIP "pgsql-service", port 5432
+│       └── namespace/
+│           ├── Backend-namespace.yaml   # Namespace backend-copy-namespace (6f)
+│           └── Backend-deploymentcopy.yaml  # backend Deployment inside that namespace
 ├── FrontEnd/
 │   ├── Dockerfile                       # recipe for k8-frontend:dev
 │   ├── src/App.jsx                      # fetches the products
@@ -612,7 +620,7 @@ spec:
             - containerPort: 5432
 ```
 
-**Why PostgreSQL is inside the backend Deployment.** With separate Pods, the database Pod gets a new IP every time it is recreated, so a hard-coded `DB_HOST` breaks (the weakness in [section 9](#9-frontend-backend-and-postgresql-communication)). Containers in the **same Pod share one network namespace**, so the backend reaches PostgreSQL on `127.0.0.1:5432`. That is why `Pgsql-deployment.yaml` (a standalone DB Deployment) isn't used: its Pod IP would change. It has a comment saying so.
+**Why PostgreSQL is inside the backend Deployment.** With separate Pods, the database Pod gets a new IP every time it is recreated, so a hard-coded `DB_HOST` breaks (the weakness in [section 9](#9-frontend-backend-and-postgresql-communication)). Containers in the **same Pod share one network namespace**, so the backend reaches PostgreSQL on `127.0.0.1:5432`. That was my first design. **Later I moved PostgreSQL back out** into `Pgsql-deployment.yaml` and put a `pgsql-service` in front of it, so its changing Pod IP no longer matters (see [6c](#where-i-use-a-service-name-instead-of-127001) and [6d](#6d-configmap-yaml-file)).
 
 **Trade-offs of this shortcut** (fine for learning, not for real systems):
 
@@ -827,9 +835,10 @@ data:                         # plain key: value pairs (all values are strings)
   DB_HOST: "pgsql-service"    # the Service name of PostgreSQL, not an IP
   DB_NAME: "k8_learning"
   DB_PORT: "5432"
-  DB_USER: "postgres"
-  DB_PASSWORD: "Cloud@123"
+  # DB_USER and DB_PASSWORD were here at first. I later moved them to a Secret (see 6e).
 ```
+
+> **Update:** `DB_USER` and `DB_PASSWORD` are now commented out of this file and live in a **Secret** ([6e](#6e-secret-yaml-file)). The rest of this section shows the first version, where all five keys were in the ConfigMap, because that is how I learned `envFrom` and `configMapKeyRef`.
 
 ### Using it in the backend: `envFrom`
 
@@ -884,7 +893,7 @@ You must specify POSTGRES_PASSWORD to a non-empty value for the superuser.
 
 - **Create the ConfigMap first.** If a Pod refers to a ConfigMap that doesn't exist, it stays in `CreateContainerConfigError`.
 - **Changing a ConfigMap does not update running Pods.** Environment variables are read only when the container starts. After editing, run `kubectl apply -f Backend-config.yaml` and then `kubectl rollout restart deployment backend-deployment` (and the same for `pgsql-deployment`). *(I first thought no restart was needed. That is wrong for env variables.)*
-- **A ConfigMap is not secret.** The values are stored as plain text, so `DB_PASSWORD` should really go into a **Secret**. Keeping the password here is only for learning.
+- **A ConfigMap is not secret.** The values are stored as plain text, so anything sensitive (the password) belongs in a **Secret**. That is exactly why I moved `DB_USER` / `DB_PASSWORD` out (see [6e](#6e-secret-yaml-file)).
 - A changed `POSTGRES_PASSWORD` has no effect on a database that already exists on disk. It is only used when the database is first created.
 
 ### Commands for ConfigMaps
@@ -904,6 +913,118 @@ kubectl rollout restart deployment backend-deployment      # make Pods pick up c
 backend Pod ──DB_HOST=pgsql-service──► pgsql-service (ClusterIP :5432) ──► pgsql Pod (postgres:13)
       ▲                                                                         ▲
       └──────────────── both read their settings from ConfigMap backend-config ─┘
+```
+
+---
+
+## 6e. Secret YAML file
+
+### Why I use a Secret
+
+A ConfigMap is plain text: anyone who can read the cluster objects can read `DB_PASSWORD`. A **Secret** is the same idea (key/value settings that Pods consume as environment variables), but it is meant for sensitive data. Kubernetes handles it more carefully (separate permissions with RBAC, not shown in `kubectl describe`, can be encrypted at rest). So:
+
+| Goes in the ConfigMap (not sensitive) | Goes in the Secret (sensitive) |
+|---------------------------------------|--------------------------------|
+| `DB_HOST`, `DB_PORT`, `DB_NAME` | `DB_USER`, `DB_PASSWORD` |
+
+### My Secret (`BackEnd/kubernetes/Backend-secret.yaml`)
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: backend-secret
+type: Opaque                  # generic key/value secret
+stringData:                   # I write plain text here; Kubernetes stores it base64-encoded
+  DB_USER: "postgres"
+  DB_PASSWORD: "Cloud@123"
+```
+
+- `stringData` lets me write normal text. With `data:` I would have to base64-encode each value myself.
+- **Base64 is not encryption.** `kubectl get secret backend-secret -o yaml` shows base64 values, and `echo <value> | base64 -d` reveals them. The real protection is access control, and never committing real passwords to Git.
+
+### Using the ConfigMap and the Secret together
+
+The backend now needs values from two objects, so I replaced `envFrom` with explicit `env` entries:
+
+```yaml
+env:
+  - name: DB_HOST
+    valueFrom:
+      configMapKeyRef: { name: backend-config, key: DB_HOST }
+  - name: DB_PORT
+    valueFrom:
+      configMapKeyRef: { name: backend-config, key: DB_PORT }
+  - name: DB_NAME
+    valueFrom:
+      configMapKeyRef: { name: backend-config, key: DB_NAME }
+  - name: DB_USER
+    valueFrom:
+      secretKeyRef:   { name: backend-secret, key: DB_USER }
+  - name: DB_PASSWORD
+    valueFrom:
+      secretKeyRef:   { name: backend-secret, key: DB_PASSWORD }
+```
+
+(My real file writes each one on separate lines; the `{ ... }` form above is just shorter.) `secretKeyRef` works exactly like `configMapKeyRef`, but reads from a Secret. PostgreSQL does the same: `POSTGRES_USER` / `POSTGRES_PASSWORD` come from `backend-secret` through `secretKeyRef`, and `POSTGRES_DB` from the ConfigMap.
+
+### Notes
+
+- Create the Secret **before** the Deployments that use it, or the Pod stays in `CreateContainerConfigError`.
+- Like a ConfigMap, a changed Secret only reaches a Pod after `kubectl rollout restart`.
+- `Backend-secret.yaml` holds the password in plain text, so it must **not** be pushed to a public repo as is. Use placeholders or create it with `kubectl create secret generic ... --from-literal=...`.
+
+```bash
+kubectl apply -f BackEnd/kubernetes/Backend-secret.yaml
+kubectl get secret
+kubectl describe secret backend-secret                      # shows key names and sizes, not values
+kubectl get secret backend-secret -o jsonpath='{.data.DB_USER}' | base64 -d
+```
+
+---
+
+## 6f. Namespace YAML file
+
+### What a Namespace is
+
+A **Namespace** is a named box inside the cluster that groups resources (Pods, Deployments, Services, ConfigMaps, Secrets). Everything I created so far lives in the `default` namespace. Namespaces let me keep projects or environments (dev / test) apart, use the same names in each, and apply limits per namespace.
+
+### My Namespace (`BackEnd/kubernetes/namespace/Backend-namespace.yaml`)
+
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: backend-copy-namespace
+```
+
+To put something in it, add `namespace:` to its `metadata`. My copy of the backend Deployment (`namespace/Backend-deploymentcopy.yaml`) does this:
+
+```yaml
+metadata:
+  name: backend-deployment
+  namespace: backend-copy-namespace
+```
+
+### What I learned from testing it
+
+`backend-deployment` in `backend-copy-namespace` stayed at `0/1` with `CreateContainerConfigError`. The reason: **ConfigMaps and Secrets are namespaced too**. A Pod can only use a ConfigMap / Secret from **its own namespace**, and `backend-config` / `backend-secret` exist only in `default`. The fix is to create them in the new namespace as well:
+
+```bash
+kubectl apply -f BackEnd/kubernetes/Backend-config.yaml -n backend-copy-namespace
+kubectl apply -f BackEnd/kubernetes/Backend-secret.yaml -n backend-copy-namespace
+```
+
+Services need care too: `DB_HOST: pgsql-service` only resolves within the same namespace. From another namespace the full name is `pgsql-service.default.svc.cluster.local`.
+
+### Commands
+
+```bash
+kubectl apply -f BackEnd/kubernetes/namespace/Backend-namespace.yaml
+kubectl get namespaces
+kubectl get all -n backend-copy-namespace     # -n selects the namespace
+kubectl get pods -A                           # all namespaces
+kubectl delete namespace backend-copy-namespace   # deletes EVERYTHING inside it
 ```
 
 ---
@@ -1187,6 +1308,8 @@ kubectl apply -f BackEnd/kubernetes/Backend-pod.yaml
 - Splitting PostgreSQL into its own Deployment + `pgsql-service`, and seeding it with `kubectl exec -i deploy/pgsql-deployment -- psql ... < file.sql`.
 - Reading the `POSTGRES_PASSWORD` error: the Postgres image only understands `POSTGRES_*` variable names.
 - A ConfigMap change needs `kubectl rollout restart` to reach running Pods.
+- Writing a Secret (`stringData`, `secretKeyRef`) and splitting config: non-sensitive values in the ConfigMap, user/password in the Secret ([6e](#6e-secret-yaml-file)). Base64 is not encryption.
+- Creating a Namespace and putting resources in it with `metadata.namespace` ([6f](#6f-namespace-yaml-file)); ConfigMaps and Secrets must be in the same namespace as the Pod that uses them.
 
 ## 12. What I plan to learn next
 
@@ -1196,7 +1319,8 @@ These are **not done yet**; they are my to-do list.
 - [ ] **NodePort / LoadBalancer Services**. (A separate PostgreSQL Deployment with `pgsql-service` is done.)
 - [x] **Deployments**: self-healing Pods, replicas, rolling updates (basics done, see [6b](#6b-deployment-yaml-files-pod--deployment)).
 - [x] **ConfigMaps**: move settings out of the Pod YAML (done, see [6d](#6d-configmap-yaml-file)).
-- [ ] **Secrets**: move `DB_PASSWORD` out of the ConfigMap, because a ConfigMap is plain text.
+- [x] **Secrets**: `DB_USER` / `DB_PASSWORD` moved out of the ConfigMap (done, see [6e](#6e-secret-yaml-file)). Still to do: don't commit real passwords.
+- [x] **Namespaces**: created one and learned that ConfigMaps/Secrets are per-namespace (basics done, see [6f](#6f-namespace-yaml-file)).
 - [ ] **Persistent storage** (PersistentVolume / PersistentVolumeClaim): keep PostgreSQL data across Pod restarts.
 - [ ] **Ingress**: route outside traffic to the frontend and backend.
 - [ ] Add a `.dockerignore`, and production-style images (no dev server).
