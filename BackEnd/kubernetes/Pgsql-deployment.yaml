@@ -41,3 +41,10 @@ spec:
                   key: DB_NAME
           ports:
             - containerPort: 5432
+          volumeMounts:
+            - name: backend-pv-storage
+              mountPath: /var/lib/postgresql/data
+      volumes:
+        - name: backend-pv-storage
+          persistentVolumeClaim:
+            claimName: backend-pvc

@@ -19,6 +19,7 @@ A beginner's journal of learning **Docker** and **Kubernetes (Minikube)** by run
    - [6d. ConfigMap YAML file](#6d-configmap-yaml-file)
    - [6e. Secret YAML file](#6e-secret-yaml-file)
    - [6f. Namespace YAML file](#6f-namespace-yaml-file)
+   - [6g. PersistentVolume and PersistentVolumeClaim](#6g-persistentvolume-and-persistentvolumeclaim)
 7. [Commands explained](#7-commands-explained)
 8. [Kubernetes architecture: control plane and worker nodes](#8-kubernetes-architecture-control-plane-and-worker-nodes)
 9. [Frontend, backend and PostgreSQL communication](#9-frontend-backend-and-postgresql-communication)
@@ -77,7 +78,9 @@ kubernetsLearning/
 │       ├── Backend-config.yaml          # ConfigMap: DB_HOST, DB_PORT, DB_NAME (6d)
 │       ├── Backend-secret.yaml          # Secret: DB_USER, DB_PASSWORD (6e)
 │       ├── Pgsql-pod.yaml
-│       ├── Pgsql-deployment.yaml        # standalone PostgreSQL Deployment (in use)
+│       ├── Pgsql-deployment.yaml        # standalone PostgreSQL Deployment (mounts the PVC)
+│       ├── pv.yaml                      # PersistentVolume backend-pv, 300Mi hostPath (6g)
+│       ├── pvc.yaml                     # PersistentVolumeClaim backend-pvc (6g)
 │       ├── Pgsql-service.yaml           # ClusterIP "pgsql-service", port 5432
 │       └── namespace/
 │           ├── Backend-namespace.yaml   # Namespace backend-copy-namespace (6f)
@@ -626,7 +629,7 @@ spec:
 
 - The DB and the backend live and die together, so `replicas: 2` would give two *separate, empty* databases.
 - There is no volume, so the data is lost whenever the Pod is recreated.
-- The proper fix is a separate PostgreSQL Deployment plus a **Service** (stable name) and a PersistentVolumeClaim. Those are next on my list.
+- The proper fix is a separate PostgreSQL Deployment plus a **Service** (stable name) and a PersistentVolumeClaim. I did this later: see [6c](#6c-service-yaml-files) and [6g](#6g-persistentvolume-and-persistentvolumeclaim).
 
 ### 6b.3 Commands for Deployments
 
@@ -1029,6 +1032,98 @@ kubectl delete namespace backend-copy-namespace   # deletes EVERYTHING inside it
 
 ---
 
+## 6g. PersistentVolume and PersistentVolumeClaim
+
+### Why I need them
+
+Every time the PostgreSQL Pod was recreated (for example after editing `Pgsql-deployment.yaml`), the `products` table and its rows disappeared and I had to run the migration and seed again. A container's filesystem is thrown away with the container. To keep the database files, they must live on storage that outlives the Pod.
+
+- **PersistentVolume (PV):** a piece of storage in the cluster. It is cluster-wide (not namespaced).
+- **PersistentVolumeClaim (PVC):** a Pod's request for storage ("I need 300Mi, read-write"). Kubernetes matches the claim to a suitable PV.
+- The Pod never mentions the PV. It only names the **PVC**.
+
+### My PersistentVolume (`BackEnd/kubernetes/pv.yaml`)
+
+```yaml
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: backend-pv
+spec:
+  storageClassName: pgsql-storage
+  capacity:
+    storage: 300Mi
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  hostPath:
+    path: /mnt/data/postgres
+```
+
+| Field | Meaning |
+|-------|---------|
+| `storageClassName` | A label used to match PV and PVC. Here it is a name I chose, `pgsql-storage`, not a real provisioner. |
+| `capacity.storage` | Size of the volume. |
+| `accessModes: ReadWriteOnce` | One node can mount it read-write. |
+| `persistentVolumeReclaimPolicy: Retain` | When the PVC is deleted, keep the data (instead of `Delete`). |
+| `hostPath.path` | The folder **on the Minikube node** that holds the files. Fine for learning on one node, not for real clusters. |
+
+### My PersistentVolumeClaim (`BackEnd/kubernetes/pvc.yaml`)
+
+```yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: backend-pvc
+spec:
+  storageClassName: pgsql-storage
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 300Mi
+```
+
+The claim binds to the PV because the `storageClassName` and `accessModes` match and the PV is big enough (300Mi >= 300Mi).
+
+### Using it in the PostgreSQL Deployment
+
+Added to `Pgsql-deployment.yaml`:
+
+```yaml
+          volumeMounts:
+            - name: backend-pv-storage
+              mountPath: /var/lib/postgresql/data
+      volumes:
+        - name: backend-pv-storage
+          persistentVolumeClaim:
+            claimName: backend-pvc
+```
+
+- `volumes` (Pod level) says "this Pod uses the claim `backend-pvc`, call it `backend-pv-storage`".
+- `volumeMounts` (container level) mounts it at `/var/lib/postgresql/data`, the folder where the `postgres` image keeps its database files.
+
+### Commands
+
+```bash
+kubectl apply -f BackEnd/kubernetes/pv.yaml
+kubectl apply -f BackEnd/kubernetes/pvc.yaml
+kubectl apply -f BackEnd/kubernetes/Pgsql-deployment.yaml
+kubectl get pv,pvc          # both should show STATUS Bound
+```
+
+Current state on my cluster: `backend-pv` is `Bound` to `default/backend-pvc`.
+
+### Things to watch
+
+- **Apply order:** PV and PVC first, then the Deployment. Otherwise the Pod stays `Pending`.
+- **Data is only kept from now on.** The first time the volume is mounted it is empty, so the migration and seed must be run once more ([section 9](#setting-up-the-tables)).
+- **Not yet confirmed by a test:** I still need to delete the PostgreSQL Pod (`kubectl delete pod -l app=pgsql`) and check that the `products` rows survive.
+- `hostPath` data lives inside the Minikube node. `minikube delete` removes it.
+- With `Retain`, deleting the PVC leaves the PV in `Released` state; it must be cleaned up by hand before it can be claimed again.
+
+---
+
 ## 7. Commands explained
 
 > Commands are listed from my practice. I have not re-run each one while writing this README, so treat sample outputs as examples.
@@ -1239,7 +1334,7 @@ kubectl exec -it pgsql-pod -- psql -U postgres -d k8_learning -c 'SELECT * FROM 
 
 ### Why data can be lost
 
-Inside a container, files live in a writable layer that belongs to *that* container. When the Pod is deleted and re-created, the PostgreSQL container starts from the clean image again: **empty data, tables gone**, and `POSTGRES_*` variables initialize it from scratch. My setup has no persistent storage, so anything I insert is temporary. Persistent storage (PersistentVolumes / PersistentVolumeClaims) is a future topic, and I haven't implemented it.
+Inside a container, files live in a writable layer that belongs to *that* container. When the Pod is deleted and re-created, the PostgreSQL container starts from the clean image again: **empty data, tables gone**, and `POSTGRES_*` variables initialize it from scratch. Without persistent storage anything I insert is temporary, which is what happened to me several times. I have since added a PersistentVolume and PersistentVolumeClaim and mounted them in the PostgreSQL Deployment ([6g](#6g-persistentvolume-and-persistentvolumeclaim)); the restart test is still to do.
 
 ---
 
@@ -1310,6 +1405,7 @@ kubectl apply -f BackEnd/kubernetes/Backend-pod.yaml
 - A ConfigMap change needs `kubectl rollout restart` to reach running Pods.
 - Writing a Secret (`stringData`, `secretKeyRef`) and splitting config: non-sensitive values in the ConfigMap, user/password in the Secret ([6e](#6e-secret-yaml-file)). Base64 is not encryption.
 - Creating a Namespace and putting resources in it with `metadata.namespace` ([6f](#6f-namespace-yaml-file)); ConfigMaps and Secrets must be in the same namespace as the Pod that uses them.
+- Writing a PersistentVolume and PersistentVolumeClaim, matching them with `storageClassName`, and mounting the claim with `volumes` + `volumeMounts` ([6g](#6g-persistentvolume-and-persistentvolumeclaim)).
 
 ## 12. What I plan to learn next
 
@@ -1321,7 +1417,7 @@ These are **not done yet**; they are my to-do list.
 - [x] **ConfigMaps**: move settings out of the Pod YAML (done, see [6d](#6d-configmap-yaml-file)).
 - [x] **Secrets**: `DB_USER` / `DB_PASSWORD` moved out of the ConfigMap (done, see [6e](#6e-secret-yaml-file)). Still to do: don't commit real passwords.
 - [x] **Namespaces**: created one and learned that ConfigMaps/Secrets are per-namespace (basics done, see [6f](#6f-namespace-yaml-file)).
-- [ ] **Persistent storage** (PersistentVolume / PersistentVolumeClaim): keep PostgreSQL data across Pod restarts.
+- [x] **Persistent storage** (PersistentVolume / PersistentVolumeClaim): created and mounted, PV is `Bound` (see [6g](#6g-persistentvolume-and-persistentvolumeclaim)). Still to do: delete the PostgreSQL Pod and confirm the data survives.
 - [ ] **Ingress**: route outside traffic to the frontend and backend.
 - [ ] Add a `.dockerignore`, and production-style images (no dev server).
 - [ ] Health checks (liveness / readiness probes) using the backend's `/health` endpoint.
