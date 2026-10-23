@@ -20,10 +20,31 @@ spec:
       # hostNetwork: true
       containers:
         - name: backend-container
-          image: vigneshpandianv/k8-backend:v2
+          image: vigneshpandianv/k8-backend:v4
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 3000
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 3000
+            periodSeconds: 10
+            failureThreshold: 3
+
+          livenessProbe:
+            httpGet:
+              path: /live
+              port: 3000
+            periodSeconds: 10
+            failureThreshold: 3
           # envFrom:
           #   - configMapRef:
           #       name: backend-config #hide because some of the data need to get from secret.yaml file so that

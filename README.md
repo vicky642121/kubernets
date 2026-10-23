@@ -20,6 +20,9 @@ A beginner's journal of learning **Docker** and **Kubernetes (Minikube)** by run
    - [6e. Secret YAML file](#6e-secret-yaml-file)
    - [6f. Namespace YAML file](#6f-namespace-yaml-file)
    - [6g. PersistentVolume and PersistentVolumeClaim](#6g-persistentvolume-and-persistentvolumeclaim)
+   - [6h. Health probes (startup, readiness, liveness)](#6h-health-probes-startup-readiness-liveness)
+   - [6i. Job: running the migration and seed in the cluster](#6i-job-running-the-migration-and-seed-in-the-cluster)
+   - [6j. CronJob: running a task on a schedule](#6j-cronjob-running-a-task-on-a-schedule)
 7. [Commands explained](#7-commands-explained)
 8. [Kubernetes architecture: control plane and worker nodes](#8-kubernetes-architecture-control-plane-and-worker-nodes)
 9. [Frontend, backend and PostgreSQL communication](#9-frontend-backend-and-postgresql-communication)
@@ -39,7 +42,7 @@ A beginner's journal of learning **Docker** and **Kubernetes (Minikube)** by run
 | Backend | Node.js + Express + `pg` | `k8-backend:v1` | 3000 |
 | Database | PostgreSQL | `postgres:13` (official image) | 5432 |
 
-The backend exposes `GET /health`, `GET /api/products` and `GET /api/products/:id`. Products are read from a `products` table in PostgreSQL. The frontend fetches the product list and shows it.
+The backend exposes `GET /health`, `GET /ready`, `GET /live` (the three probe endpoints, see [6h](#6h-health-probes-startup-readiness-liveness)), `GET /api/products` and `GET /api/products/:id`. Products are read from a `products` table in PostgreSQL. The frontend fetches the product list and shows it.
 
 There is also a small `PythonBackEnd/` (FastAPI) folder. It is a side experiment and is **not** part of the Kubernetes setup described here.
 
@@ -62,10 +65,10 @@ kubernetsLearning/
 ├── BackEnd/
 │   ├── Dockerfile                       # recipe for k8-backend:v1
 │   ├── package.json
-│   ├── migrate.js                       # runs the CREATE TABLE migration
+│   ├── migrate.js                       # runs the CREATE TABLE migration, then the seed
 │   ├── src/
 │   │   ├── server.js                    # starts Express on 0.0.0.0:PORT
-│   │   ├── app.js                       # middleware + routes + error handler
+│   │   ├── app.js                       # middleware + routes + error handler + /health /ready /live
 │   │   ├── db.js                        # PostgreSQL connection pool
 │   │   └── routes/product.routes.js     # /api/products endpoints
 │   ├── database/
@@ -74,6 +77,8 @@ kubernetsLearning/
 │   └── kubernetes/
 │       ├── Backend-pod.yaml
 │       ├── Backend-deployment.yaml      # backend; settings from ConfigMap + Secret
+│       ├── Backend-job.yaml             # Job: runs `npm run migrate` (migration + seed) (6i)
+│       ├── Backend-cronjob.yaml         # CronJob: busybox echo every minute (6j)
 │       ├── Backend-service.yaml         # ClusterIP, port 3000
 │       ├── Backend-config.yaml          # ConfigMap: DB_HOST, DB_PORT, DB_NAME (6d)
 │       ├── Backend-secret.yaml          # Secret: DB_USER, DB_PASSWORD (6e)
@@ -1124,6 +1129,199 @@ Current state on my cluster: `backend-pv` is `Bound` to `default/backend-pvc`.
 
 ---
 
+## 6h. Health probes (startup, readiness, liveness)
+
+### Why I need them
+
+A Pod can be `Running` while the app inside is not able to serve requests (for example the backend has started but PostgreSQL is not reachable yet). Probes let Kubernetes ask the app directly.
+
+| Probe | Question Kubernetes asks | If it fails |
+|-------|--------------------------|-------------|
+| `startupProbe` | "Has the app finished starting?" | The container is **killed and restarted**. Readiness and liveness wait until this passes. |
+| `readinessProbe` | "Can it take traffic right now?" | The Pod is taken out of the Service (no restart). |
+| `livenessProbe` | "Is it still alive?" | The container is **killed and restarted**. |
+
+### The endpoints (`BackEnd/src/app.js`)
+
+| Endpoint | Behaviour |
+|----------|-----------|
+| `/health` | `503` until the startup check `SELECT 1` against PostgreSQL succeeds, then `200`. |
+| `/ready` | Same rule: `503` until the DB check succeeds, then `200`. |
+| `/live` | Always `200 "Application alive"`. It does not touch the DB. |
+
+`initializeApp()` runs once when the app loads. It runs `SELECT 1`, and on success sets `initializationComplete = true`.
+
+### In the backend Deployment (`BackEnd/kubernetes/Backend-deployment.yaml`)
+
+```yaml
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 3000
+            periodSeconds: 10
+            failureThreshold: 3
+
+          livenessProbe:
+            httpGet:
+              path: /live
+              port: 3000
+            periodSeconds: 10
+            failureThreshold: 3
+```
+
+The image tag in this file is now `vigneshpandianv/k8-backend:v4` (pushed to Docker Hub), instead of `v2`. I first tried `devlatest`, then moved to a numbered tag, which also avoids the stale-tag problem below.
+
+### Mistakes and things to watch
+
+- **Field names are camelCase.** I first wrote `StartupProbe`, `ReadinessProbe` and `LivenessProbe` with capital letters. Kubernetes expects `startupProbe`, `readinessProbe`, `livenessProbe`. A wrong name can be rejected or silently ignored, so the probes would not work.
+- **The startup window is short.** With `initialDelaySeconds: 5`, `periodSeconds: 10` and `failureThreshold: 3`, the container is killed after about 35 seconds if `/health` has not returned `200`. Since `/health` waits for the database, a slow or missing PostgreSQL causes a restart loop (`CrashLoopBackOff`). Fix: raise `failureThreshold` (for example 30), or point `startupProbe` at `/live`.
+- **Unhandled error at startup.** `initializeApp()` rethrows the DB error and nothing catches it where it is called, so on newer Node versions a DB that is not ready at the instant of boot can crash the process. Still to fix (add a `.catch`, or retry).
+- **A re-pushed tag is not re-pulled.** With `imagePullPolicy: IfNotPresent`, a node that already has `devlatest` keeps using its old copy. Use a new tag, or `imagePullPolicy: Always`.
+- **I have not verified these probes on my cluster yet.** To check: `kubectl describe pod <pod>` (the Events show failed probes) and `kubectl logs <pod> --previous`.
+
+---
+
+## 6i. Job: running the migration and seed in the cluster
+
+### Why a Job
+
+Until now I created the table and rows by piping SQL into `psql` with `kubectl exec`. That is manual and easy to forget after the database is recreated. A **Job** runs a Pod **to completion** (once) and then stops. That fits a migration: run `npm run migrate`, finish, done. A Deployment would restart the container forever.
+
+### My Job (`BackEnd/kubernetes/Backend-job.yaml`)
+
+```yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: backend-migration-job
+spec:
+  parallelism: 1
+  completions: 1
+  backoffLimit: 1
+  activeDeadlineSeconds: 300
+  template:
+    metadata:
+      name: backend-migration-job
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: backend-migration-container
+          image: vigneshpandianv/k8-backend:v4
+          imagePullPolicy: IfNotPresent
+          command: ["npm", "run", "migrate"]
+          env:                      # same DB_* variables as the backend Deployment
+            - name: DB_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: backend-config
+                  key: DB_HOST
+            # DB_PORT and DB_NAME: configMapKeyRef -> backend-config
+            # DB_USER and DB_PASSWORD: secretKeyRef -> backend-secret
+```
+
+(The full file has all five variables, exactly as in `Backend-deployment.yaml`.)
+
+| Field | Meaning |
+|-------|---------|
+| `completions: 1` | The Job is done after 1 successful Pod. |
+| `parallelism: 1` | Run one Pod at a time. |
+| `backoffLimit: 1` | Retry a failed Pod at most once before marking the Job failed. |
+| `activeDeadlineSeconds: 300` | Stop the Job after 5 minutes whatever happens. |
+| `restartPolicy: Never` | Do not restart the container inside the Pod. A Job Pod must use `Never` or `OnFailure` (not `Always`). |
+| `command: ["npm","run","migrate"]` | Replaces the image's default `CMD` (`npm run dev`), so this Pod runs `migrate.js` instead of starting the server. |
+
+`migrate.js` runs the table migration and then the seed. The image must contain the `database/seeders/` folder and the latest `migrate.js`, which is why the Job uses the newly built tag `v4`.
+
+### Commands
+
+```bash
+kubectl apply -f BackEnd/kubernetes/Backend-job.yaml
+kubectl get jobs                              # COMPLETIONS shows 1/1 when it succeeded
+kubectl logs job/backend-migration-job        # "Migration completed successfully" + "Seeding completed successfully"
+kubectl delete job backend-migration-job      # needed before applying it again
+```
+
+### Things to watch
+
+- **Apply order:** the `backend-config` ConfigMap, `backend-secret` Secret and the PostgreSQL Deployment + `pgsql-service` must already exist, or the Job fails on `CreateContainerConfigError` or a connection error.
+- **A Job's Pod template cannot be edited.** To re-run it, delete the Job and apply it again.
+- **The database must be reachable when the Job starts.** If PostgreSQL is not ready yet, the one allowed retry may not be enough.
+- Safe to re-run: the migration uses `CREATE TABLE IF NOT EXISTS` and the seed uses `ON CONFLICT (id) DO NOTHING`.
+- Not yet verified on my cluster.
+
+---
+
+## 6j. CronJob: running a task on a schedule
+
+### What it is
+
+A **CronJob** creates a new **Job** on a repeating schedule, like `cron` on Linux. Each run is a Job ([6i](#6i-job-running-the-migration-and-seed-in-the-cluster)), which creates a Pod that runs to completion.
+
+CronJob → creates Job → creates Pod.
+
+### My CronJob (`BackEnd/kubernetes/Backend-cronjob.yaml`)
+
+```yaml
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: backend-cronjob
+spec:
+  schedule: "* * * * *"            # every minute
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: backend-cronjob-container
+              image: busybox:latest
+              imagePullPolicy: IfNotPresent
+              command: ["sh", "-c", "echo 'Hello from kubernetes cron job...'"]
+```
+
+| Field | Meaning |
+|-------|---------|
+| `schedule` | Standard cron format: `minute hour day-of-month month day-of-week`. `* * * * *` = every minute. `0 2 * * *` would be 02:00 every day. |
+| `concurrencyPolicy: Forbid` | If the previous run is still going, skip the new one. (`Allow` is the default and runs them side by side; `Replace` stops the old run.) |
+| `jobTemplate` | The Job to create each time. Everything under it is an ordinary Job spec. |
+| `backoffLimit: 1` | Retry a failed Pod once. |
+| `restartPolicy: Never` | Do not restart the container inside the Pod. |
+| `command` | Replaces the image's default command. This one just prints a message. |
+
+This is a practice example: it only prints a line with `busybox`. It does not touch the app or the database yet.
+
+### Commands
+
+```bash
+kubectl apply -f BackEnd/kubernetes/Backend-cronjob.yaml
+kubectl get cronjob                           # shows SCHEDULE, LAST SCHEDULE, ACTIVE
+kubectl get jobs                              # one Job appears per run
+kubectl get pods                              # finished Pods stay as Completed
+kubectl logs <pod-name>                       # "Hello from kubernetes cron job..."
+kubectl delete cronjob backend-cronjob
+```
+
+### Things to watch
+
+- **Every minute is only for testing.** It creates a new Job and Pod each minute. Delete the CronJob when finished, or change the schedule.
+- Kubernetes keeps only the last few finished Jobs (by default 3 successful and 1 failed), so old Pods are cleaned up.
+- `busybox:latest` uses the `:latest` tag, which defaults to pulling the image each time unless `imagePullPolicy: IfNotPresent` is set. I set it. A fixed tag such as `busybox:1.36` is better practice.
+- The schedule uses the cluster's time zone (usually UTC), not necessarily my local time.
+- Not yet verified on my cluster.
+
+---
+
 ## 7. Commands explained
 
 > Commands are listed from my practice. I have not re-run each one while writing this README, so treat sample outputs as examples.
@@ -1320,7 +1518,7 @@ kubectl exec -i pgsql-pod -- psql -U postgres -d k8_learning \
   < BackEnd/database/seeders/001_seed_products.sql
 ```
 
-(`-i` without `-t` because we're piping a file in, not typing.) Another way is `node migrate.js` from my machine, which needs the DB to be reachable from there.
+(`-i` without `-t` because we're piping a file in, not typing.) Another way is `npm run migrate` (`node migrate.js`) from my machine, which needs the DB to be reachable from there. `migrate.js` now runs **both** files in order: the migration first, then `database/seeders/001_seed_products.sql`. It is safe to run again, because the migration uses `CREATE TABLE IF NOT EXISTS` and the seed uses `ON CONFLICT (id) DO NOTHING`.
 
 ### Verifying
 
@@ -1362,6 +1560,9 @@ kubectl logs <pod-name>
 | **Database/table missing** (`database "x" does not exist`, `relation "products" does not exist`) | Nothing created it. `POSTGRES_DB` only runs on first init, and tables are never auto-created. | Check `\l` and `\dt`. Run the migration and seed SQL ([section 9](#setting-up-the-tables)). If you changed `POSTGRES_DB` after first start, delete and re-create the Pod. |
 | **Backend can't connect** (`ECONNREFUSED`, `password authentication failed`, timeouts) | Wrong host, port, user or password; DB Pod not ready; DB Pod got a new IP. | 1) `kubectl get pods -o wide` and compare the IP with `DB_HOST`. 2) Match creds with `POSTGRES_*`. 3) Make sure the variable names the code reads exist in the YAML (see the mismatch note in [section 6](#the-backend-environment-variables)). 4) `kubectl logs backend-pod`. |
 | **Backend returns 500 on `/api/products`** | Usually a DB error (missing table, bad connection). The error handler hides details from the client. | The real message is in `kubectl logs backend-pod`. |
+| **Pod `Running` but `0/1` Ready, or restarting** | A probe is failing. `/health` and `/ready` return `503` until the DB check passes. | `kubectl describe pod <pod>` (look for `Startup probe failed` / `Readiness probe failed`), then `kubectl logs <pod> --previous`. See [6h](#6h-health-probes-startup-readiness-liveness). |
+| **Probes seem to do nothing** | Field names were written `StartupProbe` instead of `startupProbe`. | Use camelCase, then re-apply. |
+| **New image pushed but old behaviour** | Same tag, and `IfNotPresent` reuses the node's cached copy. | Use a new tag or `imagePullPolicy: Always`. |
 | **Changed code but nothing changed** | The Pod still runs the old image. | Rebuild, `minikube image load`, delete the Pod, `kubectl apply` again. |
 | **`minikube start` errors** | Docker not running, no permission, or too little memory. | `docker ps` to check Docker. Fix the `docker` group membership. Try `minikube delete` then `minikube start --driver=docker`. Read the message; it usually names the cause. |
 | **`kubectl` can't connect to server** | Cluster stopped. | `minikube status`, then `minikube start`. |
@@ -1406,6 +1607,10 @@ kubectl apply -f BackEnd/kubernetes/Backend-pod.yaml
 - Writing a Secret (`stringData`, `secretKeyRef`) and splitting config: non-sensitive values in the ConfigMap, user/password in the Secret ([6e](#6e-secret-yaml-file)). Base64 is not encryption.
 - Creating a Namespace and putting resources in it with `metadata.namespace` ([6f](#6f-namespace-yaml-file)); ConfigMaps and Secrets must be in the same namespace as the Pod that uses them.
 - Writing a PersistentVolume and PersistentVolumeClaim, matching them with `storageClassName`, and mounting the claim with `volumes` + `volumeMounts` ([6g](#6g-persistentvolume-and-persistentvolumeclaim)).
+- Writing startup, readiness and liveness probes with `httpGet`, what each does on failure, and that the field names are camelCase ([6h](#6h-health-probes-startup-readiness-liveness)).
+- Making `migrate.js` run the seed file after the migration, so the table is created and filled in one command.
+- Writing a Job (`completions`, `backoffLimit`, `restartPolicy: Never`, `command` override) to run the migration inside the cluster instead of piping SQL by hand ([6i](#6i-job-running-the-migration-and-seed-in-the-cluster)).
+- Writing a CronJob (`schedule` in cron format, `concurrencyPolicy`, `jobTemplate`) and how CronJob → Job → Pod ([6j](#6j-cronjob-running-a-task-on-a-schedule)).
 
 ## 12. What I plan to learn next
 
@@ -1418,9 +1623,11 @@ These are **not done yet**; they are my to-do list.
 - [x] **Secrets**: `DB_USER` / `DB_PASSWORD` moved out of the ConfigMap (done, see [6e](#6e-secret-yaml-file)). Still to do: don't commit real passwords.
 - [x] **Namespaces**: created one and learned that ConfigMaps/Secrets are per-namespace (basics done, see [6f](#6f-namespace-yaml-file)).
 - [x] **Persistent storage** (PersistentVolume / PersistentVolumeClaim): created and mounted, PV is `Bound` (see [6g](#6g-persistentvolume-and-persistentvolumeclaim)). Still to do: delete the PostgreSQL Pod and confirm the data survives.
+- [x] **Jobs**: migration + seed as a one-off Job (written, see [6i](#6i-job-running-the-migration-and-seed-in-the-cluster)). Still to do: run it on the cluster and confirm it completes.
+- [x] **CronJobs**: a practice CronJob that runs every minute (written, see [6j](#6j-cronjob-running-a-task-on-a-schedule)). Still to do: run it, and use a real task (for example a database cleanup).
 - [ ] **Ingress**: route outside traffic to the frontend and backend.
 - [ ] Add a `.dockerignore`, and production-style images (no dev server).
-- [ ] Health checks (liveness / readiness probes) using the backend's `/health` endpoint.
+- [x] Health checks (startup / readiness / liveness probes) written and added to the backend Deployment (see [6h](#6h-health-probes-startup-readiness-liveness)). Still to do: confirm they pass on the cluster, lengthen the startup window and catch the startup error.
 - [ ] Fix the env variable name mismatch between `db.js`, `migrate.js` and the Pod YAML.
 
 ---

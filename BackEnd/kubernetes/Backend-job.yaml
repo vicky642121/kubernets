@@ -1,0 +1,45 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: backend-migration-job
+spec:
+  parallelism: 1
+  completions: 1
+  backoffLimit: 1
+  activeDeadlineSeconds: 300
+  template:
+    metadata:
+      name: backend-migration-job
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: backend-migration-container
+          image: vigneshpandianv/k8-backend:v4
+          imagePullPolicy: IfNotPresent
+          command: ["npm", "run", "migrate"]
+          env:
+            - name: DB_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: backend-config
+                  key: DB_HOST
+            - name: DB_PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: backend-config
+                  key: DB_PORT
+            - name: DB_USER
+              valueFrom:
+                secretKeyRef:
+                  name: backend-secret
+                  key: DB_USER
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: backend-secret
+                  key: DB_PASSWORD
+            - name: DB_NAME
+              valueFrom:
+                configMapKeyRef:
+                  name: backend-config
+                  key: DB_NAME

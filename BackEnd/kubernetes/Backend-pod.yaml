@@ -8,7 +8,7 @@ spec:
   hostNetwork: true
   containers:
     - name: backend-container
-      image: vigneshpandianv/k8-backend
+      image: vigneshpandianv/k8-backend:devlatest
       imagePullPolicy: IfNotPresent
       ports:
         - containerPort: 3000
