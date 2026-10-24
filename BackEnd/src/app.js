@@ -21,7 +21,7 @@ async function initializeApp() {
   }
 }
 // Health-check endpoint
-app.get("/health", (req, res) => {
+app.get("/api/health", (req, res) => {
   if (!initializationComplete) {
     return res.status(503).json({
       success: false,
@@ -34,7 +34,7 @@ app.get("/health", (req, res) => {
   });
 });
 
-app.get("/ready", (req, res) => {
+app.get("/api/ready", (req, res) => {
   if (!initializationComplete) {
     return res.status(503).json({
       success: false,
@@ -48,7 +48,7 @@ app.get("/ready", (req, res) => {
 });
 
 // liveness endpoint
-app.get("/live", (req, res) => {
+app.get("/api/live", (req, res) => {
   res.status(200).send("Application alive");
 });
 

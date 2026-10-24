@@ -23,6 +23,7 @@ A beginner's journal of learning **Docker** and **Kubernetes (Minikube)** by run
    - [6h. Health probes (startup, readiness, liveness)](#6h-health-probes-startup-readiness-liveness)
    - [6i. Job: running the migration and seed in the cluster](#6i-job-running-the-migration-and-seed-in-the-cluster)
    - [6j. CronJob: running a task on a schedule](#6j-cronjob-running-a-task-on-a-schedule)
+   - [6k. Ingress: one entry point for frontend and backend](#6k-ingress-one-entry-point-for-frontend-and-backend)
 7. [Commands explained](#7-commands-explained)
 8. [Kubernetes architecture: control plane and worker nodes](#8-kubernetes-architecture-control-plane-and-worker-nodes)
 9. [Frontend, backend and PostgreSQL communication](#9-frontend-backend-and-postgresql-communication)
@@ -1145,9 +1146,9 @@ A Pod can be `Running` while the app inside is not able to serve requests (for e
 
 | Endpoint | Behaviour |
 |----------|-----------|
-| `/health` | `503` until the startup check `SELECT 1` against PostgreSQL succeeds, then `200`. |
-| `/ready` | Same rule: `503` until the DB check succeeds, then `200`. |
-| `/live` | Always `200 "Application alive"`. It does not touch the DB. |
+| `/api/health` | `503` until the startup check `SELECT 1` against PostgreSQL succeeds, then `200`. |
+| `/api/ready` | Same rule: `503` until the DB check succeeds, then `200`. |
+| `/api/live` | Always `200 "Application alive"`. It does not touch the DB. |
 
 `initializeApp()` runs once when the app loads. It runs `SELECT 1`, and on success sets `initializationComplete = true`.
 
@@ -1156,7 +1157,7 @@ A Pod can be `Running` while the app inside is not able to serve requests (for e
 ```yaml
           startupProbe:
             httpGet:
-              path: /health
+              path: /api/health
               port: 3000
             initialDelaySeconds: 5
             periodSeconds: 10
@@ -1164,14 +1165,14 @@ A Pod can be `Running` while the app inside is not able to serve requests (for e
 
           readinessProbe:
             httpGet:
-              path: /ready
+              path: /api/ready
               port: 3000
             periodSeconds: 10
             failureThreshold: 3
 
           livenessProbe:
             httpGet:
-              path: /live
+              path: /api/live
               port: 3000
             periodSeconds: 10
             failureThreshold: 3
@@ -1181,8 +1182,9 @@ The image tag in this file is now `vigneshpandianv/k8-backend:v4` (pushed to Doc
 
 ### Mistakes and things to watch
 
+- **Probe paths start with `/api`.** I moved the health endpoints from `/health`, `/ready`, `/live` to `/api/health`, `/api/ready`, `/api/live` so that every backend route sits under `/api` and the Ingress (6k) can send it to the backend. The Deployment and `app.js` must use the same paths, otherwise the probes get `404` and the container is restarted.
 - **Field names are camelCase.** I first wrote `StartupProbe`, `ReadinessProbe` and `LivenessProbe` with capital letters. Kubernetes expects `startupProbe`, `readinessProbe`, `livenessProbe`. A wrong name can be rejected or silently ignored, so the probes would not work.
-- **The startup window is short.** With `initialDelaySeconds: 5`, `periodSeconds: 10` and `failureThreshold: 3`, the container is killed after about 35 seconds if `/health` has not returned `200`. Since `/health` waits for the database, a slow or missing PostgreSQL causes a restart loop (`CrashLoopBackOff`). Fix: raise `failureThreshold` (for example 30), or point `startupProbe` at `/live`.
+- **The startup window is short.** With `initialDelaySeconds: 5`, `periodSeconds: 10` and `failureThreshold: 3`, the container is killed after about 35 seconds if `/health` has not returned `200`. Since `/health` waits for the database, a slow or missing PostgreSQL causes a restart loop (`CrashLoopBackOff`). Fix: raise `failureThreshold` (for example 30), or point `startupProbe` at `/api/live`.
 - **Unhandled error at startup.** `initializeApp()` rethrows the DB error and nothing catches it where it is called, so on newer Node versions a DB that is not ready at the instant of boot can crash the process. Still to fix (add a `.catch`, or retry).
 - **A re-pushed tag is not re-pulled.** With `imagePullPolicy: IfNotPresent`, a node that already has `devlatest` keeps using its old copy. Use a new tag, or `imagePullPolicy: Always`.
 - **I have not verified these probes on my cluster yet.** To check: `kubectl describe pod <pod>` (the Events show failed probes) and `kubectl logs <pod> --previous`.
@@ -1319,6 +1321,85 @@ kubectl delete cronjob backend-cronjob
 - `busybox:latest` uses the `:latest` tag, which defaults to pulling the image each time unless `imagePullPolicy: IfNotPresent` is set. I set it. A fixed tag such as `busybox:1.36` is better practice.
 - The schedule uses the cluster's time zone (usually UTC), not necessarily my local time.
 - Not yet verified on my cluster.
+
+---
+
+## 6k. Ingress: one entry point for frontend and backend
+
+### Why I need it
+
+Both Services are `ClusterIP`, so the browser can't reach them. `port-forward` works for testing but needs one terminal per Service. An **Ingress** gives one address (`http://127.0.0.1/`) and routes by URL path: `/api` goes to the backend, everything else goes to the frontend. An Ingress is only rules; an **Ingress controller** (here `ingress-nginx`) is the Pod that reads them and does the routing.
+
+### Enable the controller on Minikube
+
+```bash
+minikube addons enable ingress
+kubectl get pods -n ingress-nginx
+```
+
+### My Ingress (`ingress.yaml`)
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: app-ingress
+spec:
+  ingressClassName: nginx
+  rules:
+    - http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: backend-service
+                port:
+                  number: 3000
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend-service
+                port:
+                  number: 8080
+```
+
+| Field | Meaning |
+|-------|---------|
+| `ingressClassName: nginx` | Which controller handles these rules. |
+| `path: /api` + `pathType: Prefix` | Any URL starting with `/api` goes to `backend-service:3000`. |
+| `path: /` | Everything else goes to `frontend-service:8080`. nginx picks the longest matching prefix, so `/api/...` never reaches the frontend. |
+| `port.number` | The **Service** port, not the container port. |
+
+### Commands
+
+```bash
+kubectl apply -f ingress.yaml
+kubectl get ingress
+curl http://127.0.0.1/api/products
+```
+
+Then open `http://127.0.0.1/` in the browser.
+
+### Why the frontend calls `/api/products` and not `localhost:3000`
+
+`fetch` runs in the **browser**, so `localhost` would mean my own computer, where nothing listens on port 3000. A relative path such as `/api/products` is sent to the same host the page came from (the Ingress), which forwards it to the backend. The same code then works on any host name.
+
+### Mistakes and things to watch
+
+- **The browser showed the page but no data.** The backend was fine (`curl http://127.0.0.1/api/products` returned all products). The running frontend image was built **before** I changed `App.jsx`, so it still called `http://localhost:3000/api/products`. The Dockerfile copies the source in at build time, so editing the file does nothing until the image is rebuilt. The ingress logs showed no `/api/products` request from the page, which was the clue.
+- **Fix: rebuild and restart.** `imagePullPolicy: IfNotPresent` keeps using the old image with the same tag, so a restart alone is not enough:
+
+  ```bash
+  cd FrontEnd
+  minikube image build -t vigneshpandianv/k8-frontend:dev .
+  kubectl rollout restart deploy/frontend-deployment
+  ```
+
+  A new tag per build avoids this problem.
+- **Port 80 must be free.** I stopped Apache2 (`sudo systemctl stop apache2`) because it also uses port 80.
+- The frontend still runs the Vite dev server (port 5173). A production build served by nginx is better practice.
 
 ---
 
@@ -1463,7 +1544,9 @@ kubectl get pods -n kube-system
 
 ```text
  Browser (my computer)
-     │  http://localhost:3000/api/products   (this is what App.jsx calls)
+     │  http://127.0.0.1/api/products   (App.jsx calls the relative path /api/products)
+     ▼
+ Ingress (nginx):  /api → backend-service:3000,  / → frontend-service:8080
      ▼
 ┌──────────────┐   DB_HOST:5432    ┌──────────────┐
 │ backend-pod  │ ────────────────► │  pgsql-pod   │
@@ -1476,7 +1559,7 @@ kubectl get pods -n kube-system
 └──────────────┘
 ```
 
-Important: the **React code runs in the browser**, not inside the frontend Pod. The Pod only serves the files. So when `App.jsx` calls `http://localhost:3000/api/products`, `localhost` means **the computer running the browser**. For that to work, port 3000 of the backend has to be reachable from my machine. How I reach the Pods from my machine (for instance with `kubectl port-forward` or a Minikube-specific route) is something I'm still working out, and I don't claim a verified recipe here. Proper Services are the next step.
+Important: the **React code runs in the browser**, not inside the frontend Pod. The Pod only serves the files. So `App.jsx` calls the relative path `/api/products`. The browser sends it to the same address as the page (`http://127.0.0.1/`), the Ingress ([6k](#6k-ingress-one-entry-point-for-frontend-and-backend)) sees the `/api` prefix and forwards it to `backend-service`. If it called `http://localhost:3000/...`, `localhost` would mean **the computer running the browser**, where nothing listens on port 3000, and the request would fail.
 
 ### Docker image vs Kubernetes Pod (recap)
 
@@ -1610,6 +1693,8 @@ kubectl apply -f BackEnd/kubernetes/Backend-pod.yaml
 - Writing startup, readiness and liveness probes with `httpGet`, what each does on failure, and that the field names are camelCase ([6h](#6h-health-probes-startup-readiness-liveness)).
 - Making `migrate.js` run the seed file after the migration, so the table is created and filled in one command.
 - Writing a Job (`completions`, `backoffLimit`, `restartPolicy: Never`, `command` override) to run the migration inside the cluster instead of piping SQL by hand ([6i](#6i-job-running-the-migration-and-seed-in-the-cluster)).
+- Writing an Ingress with path rules (`/api` → backend, `/` → frontend), and why the browser must call a relative path like `/api/products` instead of `localhost:3000` ([6k](#6k-ingress-one-entry-point-for-frontend-and-backend)).
+- An image is a snapshot: after editing code I must rebuild the image and restart the Deployment, and `IfNotPresent` plus an unchanged tag keeps the old copy.
 - Writing a CronJob (`schedule` in cron format, `concurrencyPolicy`, `jobTemplate`) and how CronJob → Job → Pod ([6j](#6j-cronjob-running-a-task-on-a-schedule)).
 
 ## 12. What I plan to learn next
@@ -1625,7 +1710,7 @@ These are **not done yet**; they are my to-do list.
 - [x] **Persistent storage** (PersistentVolume / PersistentVolumeClaim): created and mounted, PV is `Bound` (see [6g](#6g-persistentvolume-and-persistentvolumeclaim)). Still to do: delete the PostgreSQL Pod and confirm the data survives.
 - [x] **Jobs**: migration + seed as a one-off Job (written, see [6i](#6i-job-running-the-migration-and-seed-in-the-cluster)). Still to do: run it on the cluster and confirm it completes.
 - [x] **CronJobs**: a practice CronJob that runs every minute (written, see [6j](#6j-cronjob-running-a-task-on-a-schedule)). Still to do: run it, and use a real task (for example a database cleanup).
-- [ ] **Ingress**: route outside traffic to the frontend and backend.
+- [x] **Ingress**: `/api` to the backend and `/` to the frontend through ingress-nginx (done, see [6k](#6k-ingress-one-entry-point-for-frontend-and-backend)).
 - [ ] Add a `.dockerignore`, and production-style images (no dev server).
 - [x] Health checks (startup / readiness / liveness probes) written and added to the backend Deployment (see [6h](#6h-health-probes-startup-readiness-liveness)). Still to do: confirm they pass on the cluster, lengthen the startup window and catch the startup error.
 - [ ] Fix the env variable name mismatch between `db.js`, `migrate.js` and the Pod YAML.
