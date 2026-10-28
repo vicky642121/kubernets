@@ -24,6 +24,7 @@ A beginner's journal of learning **Docker** and **Kubernetes (Minikube)** by run
    - [6i. Job: running the migration and seed in the cluster](#6i-job-running-the-migration-and-seed-in-the-cluster)
    - [6j. CronJob: running a task on a schedule](#6j-cronjob-running-a-task-on-a-schedule)
    - [6k. Ingress: one entry point for frontend and backend](#6k-ingress-one-entry-point-for-frontend-and-backend)
+   - [6l. HorizontalPodAutoscaler: scaling the frontend on CPU](#6l-horizontalpodautoscaler-scaling-the-frontend-on-cpu)
 7. [Commands explained](#7-commands-explained)
 8. [Kubernetes architecture: control plane and worker nodes](#8-kubernetes-architecture-control-plane-and-worker-nodes)
 9. [Frontend, backend and PostgreSQL communication](#9-frontend-backend-and-postgresql-communication)
@@ -91,12 +92,14 @@ kubernetsLearning/
 │       └── namespace/
 │           ├── Backend-namespace.yaml   # Namespace backend-copy-namespace (6f)
 │           └── Backend-deploymentcopy.yaml  # backend Deployment inside that namespace
+├── ingress.yaml                         # Ingress: /api → backend, / → frontend (6k)
 ├── FrontEnd/
 │   ├── Dockerfile                       # recipe for k8-frontend:dev
 │   ├── src/App.jsx                      # fetches the products
 │   └── kubernetes/
 │       ├── Frontend-pod.yaml
-│       ├── Frontend-deployment.yaml
+│       ├── Frontend-deployment.yaml     # has CPU requests/limits for the HPA (6l)
+│       ├── Frontend-hpa.yaml            # HorizontalPodAutoscaler, 1-5 replicas at 25% CPU (6l)
 │       └── Frontend-service.yaml        # ClusterIP, 8080 → 5173
 └── PythonBackEnd/                       # separate FastAPI experiment (not in K8s)
 ```
@@ -1403,6 +1406,76 @@ Then open `http://127.0.0.1/` in the browser.
 
 ---
 
+## 6l. HorizontalPodAutoscaler: scaling the frontend on CPU
+
+### What it is
+
+A Deployment keeps a **fixed** number of Pods (`replicas`). A **HorizontalPodAutoscaler (HPA)** changes that number automatically: it watches a metric (here CPU) and raises or lowers `replicas` between a minimum and a maximum.
+
+### Resources on the Deployment (`FrontEnd/kubernetes/Frontend-deployment.yaml`)
+
+The HPA works out CPU **utilization** as usage divided by the container's CPU **request**, so the container must have one. I added this under the container:
+
+```yaml
+resources:
+  requests:
+    cpu: "10m"      # what the Pod is guaranteed; the HPA's 100% is measured against this
+  limits:
+    cpu: "100m"     # the container is throttled above this
+```
+
+`10m` means 10 millicores (0.01 of a CPU core).
+
+### My HPA (`FrontEnd/kubernetes/Frontend-hpa.yaml`)
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: frontend-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: frontend-deployment
+  minReplicas: 1
+  maxReplicas: 5
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 25
+```
+
+| Field | Meaning |
+|-------|---------|
+| `scaleTargetRef` | The object to scale: the `frontend-deployment` Deployment. |
+| `minReplicas` / `maxReplicas` | Never go below 1 or above 5 Pods. |
+| `metrics[].resource.name: cpu` | Scale on CPU usage. |
+| `averageUtilization: 25` | Aim for an average of 25% of the CPU **request** across the Pods. Above that, add Pods; well below it, remove them. |
+
+With a request of `10m`, 25% is only `2.5m`, so even a little traffic makes it scale up. That is good for seeing it work, but too sensitive for real use.
+
+### Commands
+
+```bash
+minikube addons enable metrics-server      # the HPA needs metrics-server to read CPU
+kubectl apply -f FrontEnd/kubernetes/Frontend-deployment.yaml
+kubectl apply -f FrontEnd/kubernetes/Frontend-hpa.yaml
+kubectl get hpa frontend-hpa --watch
+kubectl top pods
+```
+
+### Things to watch
+
+- **`<unknown>/25%` in `kubectl get hpa`.** metrics-server is not running yet, or the Pods have no CPU `requests`. Enable the addon and wait a minute.
+- **Remove `replicas` from the Deployment if you want the HPA to be the only one deciding**; otherwise `kubectl apply` can reset the count.
+- Scaling down is deliberately slow (about 5 minutes of low load) so the Pod count doesn't flap.
+
+---
+
 ## 7. Commands explained
 
 > Commands are listed from my practice. I have not re-run each one while writing this README, so treat sample outputs as examples.
@@ -1695,6 +1768,7 @@ kubectl apply -f BackEnd/kubernetes/Backend-pod.yaml
 - Writing a Job (`completions`, `backoffLimit`, `restartPolicy: Never`, `command` override) to run the migration inside the cluster instead of piping SQL by hand ([6i](#6i-job-running-the-migration-and-seed-in-the-cluster)).
 - Writing an Ingress with path rules (`/api` → backend, `/` → frontend), and why the browser must call a relative path like `/api/products` instead of `localhost:3000` ([6k](#6k-ingress-one-entry-point-for-frontend-and-backend)).
 - An image is a snapshot: after editing code I must rebuild the image and restart the Deployment, and `IfNotPresent` plus an unchanged tag keeps the old copy.
+- Adding CPU `requests`/`limits` to a Deployment and writing a HorizontalPodAutoscaler (`scaleTargetRef`, `minReplicas`, `maxReplicas`, `averageUtilization`), which needs metrics-server ([6l](#6l-horizontalpodautoscaler-scaling-the-frontend-on-cpu)).
 - Writing a CronJob (`schedule` in cron format, `concurrencyPolicy`, `jobTemplate`) and how CronJob → Job → Pod ([6j](#6j-cronjob-running-a-task-on-a-schedule)).
 
 ## 12. What I plan to learn next
@@ -1711,6 +1785,7 @@ These are **not done yet**; they are my to-do list.
 - [x] **Jobs**: migration + seed as a one-off Job (written, see [6i](#6i-job-running-the-migration-and-seed-in-the-cluster)). Still to do: run it on the cluster and confirm it completes.
 - [x] **CronJobs**: a practice CronJob that runs every minute (written, see [6j](#6j-cronjob-running-a-task-on-a-schedule)). Still to do: run it, and use a real task (for example a database cleanup).
 - [x] **Ingress**: `/api` to the backend and `/` to the frontend through ingress-nginx (done, see [6k](#6k-ingress-one-entry-point-for-frontend-and-backend)).
+- [x] **Autoscaling**: HPA for the frontend written (see [6l](#6l-horizontalpodautoscaler-scaling-the-frontend-on-cpu)). Still to do: generate load and watch it scale up and back down.
 - [ ] Add a `.dockerignore`, and production-style images (no dev server).
 - [x] Health checks (startup / readiness / liveness probes) written and added to the backend Deployment (see [6h](#6h-health-probes-startup-readiness-liveness)). Still to do: confirm they pass on the cluster, lengthen the startup window and catch the startup error.
 - [ ] Fix the env variable name mismatch between `db.js`, `migrate.js` and the Pod YAML.

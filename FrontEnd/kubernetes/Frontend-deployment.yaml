@@ -21,3 +21,9 @@ spec:
           tty: true
           ports:
             - containerPort: 5173
+          resources:
+            requests:
+              cpu: "10m"
+            limits:
+              cpu: "100m"
+      
