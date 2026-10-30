@@ -25,6 +25,7 @@ A beginner's journal of learning **Docker** and **Kubernetes (Minikube)** by run
    - [6j. CronJob: running a task on a schedule](#6j-cronjob-running-a-task-on-a-schedule)
    - [6k. Ingress: one entry point for frontend and backend](#6k-ingress-one-entry-point-for-frontend-and-backend)
    - [6l. HorizontalPodAutoscaler: scaling the frontend on CPU](#6l-horizontalpodautoscaler-scaling-the-frontend-on-cpu)
+   - [6m. ServiceAccount: an identity for the backend Pods](#6m-serviceaccount-an-identity-for-the-backend-pods)
 7. [Commands explained](#7-commands-explained)
 8. [Kubernetes architecture: control plane and worker nodes](#8-kubernetes-architecture-control-plane-and-worker-nodes)
 9. [Frontend, backend and PostgreSQL communication](#9-frontend-backend-and-postgresql-communication)
@@ -84,6 +85,8 @@ kubernetsLearning/
 │       ├── Backend-service.yaml         # ClusterIP, port 3000
 │       ├── Backend-config.yaml          # ConfigMap: DB_HOST, DB_PORT, DB_NAME (6d)
 │       ├── Backend-secret.yaml          # Secret: DB_USER, DB_PASSWORD (6e)
+│       ├── serviceAccount/
+│       │   └── Backend-serviceAccount.yaml  # ServiceAccount backend-service-account, no API token (6m)
 │       ├── Pgsql-pod.yaml
 │       ├── Pgsql-deployment.yaml        # standalone PostgreSQL Deployment (mounts the PVC)
 │       ├── pv.yaml                      # PersistentVolume backend-pv, 300Mi hostPath (6g)
@@ -1476,6 +1479,64 @@ kubectl top pods
 
 ---
 
+## 6m. ServiceAccount: an identity for the backend Pods
+
+### What it is
+
+A **ServiceAccount** is the identity a Pod uses when it talks to the Kubernetes API server. Users log in with `kubectl`; Pods use a ServiceAccount. Every namespace already has one called `default`, and a Pod uses it unless you say otherwise.
+
+### My ServiceAccount (`BackEnd/kubernetes/serviceAccount/Backend-serviceAccount.yaml`)
+
+```yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: backend-service-account
+automountServiceAccountToken: false
+```
+
+| Field | Meaning |
+|-------|---------|
+| `kind: ServiceAccount` | The object type. It is a core (`v1`) object, so there is no `spec`. |
+| `metadata.name` | The name Pods use to refer to it. |
+| `automountServiceAccountToken: false` | Do not put an API token inside the Pod's filesystem. |
+
+By default Kubernetes mounts a token at `/var/run/secrets/kubernetes.io/serviceaccount/` in every Pod. My backend only talks to PostgreSQL and never calls the Kubernetes API, so it does not need that token. Turning it off means that if the app is ever compromised, the attacker has no API credentials to steal (least privilege).
+
+### Using it in the backend Deployment
+
+Creating the ServiceAccount does nothing by itself. A Pod only uses it when the Pod spec names it, in `BackEnd/kubernetes/Backend-deployment.yaml`:
+
+```yaml
+spec:
+  template:
+    spec:
+      serviceAccountName: backend-service-account   # next to `containers:`
+      containers:
+        - ...
+```
+
+I have written the ServiceAccount file but have **not yet added `serviceAccountName` to the Deployment**, so the backend Pods still run as `default`.
+
+### Commands
+
+```bash
+kubectl apply -f BackEnd/kubernetes/serviceAccount/Backend-serviceAccount.yaml
+kubectl get serviceaccount
+kubectl describe serviceaccount backend-service-account
+kubectl rollout restart deployment backend-deployment      # after adding serviceAccountName
+kubectl get pod <backend-pod> -o jsonpath='{.spec.serviceAccountName}'
+```
+
+### Things to watch
+
+- A ServiceAccount is **namespaced**, like ConfigMaps and Secrets: the Pod must be in the same namespace.
+- A Pod's `serviceAccountName` cannot be changed on a running Pod; the Deployment must create new Pods (`rollout restart`).
+- If a Pod names a ServiceAccount that doesn't exist, the Pod is not created and the Deployment shows the error in its events.
+- A ServiceAccount has **no permissions** on its own. To let a Pod call the API you would also need a Role and a RoleBinding (RBAC), which I have not learned yet.
+
+---
+
 ## 7. Commands explained
 
 > Commands are listed from my practice. I have not re-run each one while writing this README, so treat sample outputs as examples.
@@ -1769,6 +1830,7 @@ kubectl apply -f BackEnd/kubernetes/Backend-pod.yaml
 - Writing an Ingress with path rules (`/api` → backend, `/` → frontend), and why the browser must call a relative path like `/api/products` instead of `localhost:3000` ([6k](#6k-ingress-one-entry-point-for-frontend-and-backend)).
 - An image is a snapshot: after editing code I must rebuild the image and restart the Deployment, and `IfNotPresent` plus an unchanged tag keeps the old copy.
 - Adding CPU `requests`/`limits` to a Deployment and writing a HorizontalPodAutoscaler (`scaleTargetRef`, `minReplicas`, `maxReplicas`, `averageUtilization`), which needs metrics-server ([6l](#6l-horizontalpodautoscaler-scaling-the-frontend-on-cpu)).
+- Writing a ServiceAccount and turning off the automatic API token with `automountServiceAccountToken: false`; a Pod only uses it through `serviceAccountName` ([6m](#6m-serviceaccount-an-identity-for-the-backend-pods)).
 - Writing a CronJob (`schedule` in cron format, `concurrencyPolicy`, `jobTemplate`) and how CronJob → Job → Pod ([6j](#6j-cronjob-running-a-task-on-a-schedule)).
 
 ## 12. What I plan to learn next
@@ -1786,6 +1848,7 @@ These are **not done yet**; they are my to-do list.
 - [x] **CronJobs**: a practice CronJob that runs every minute (written, see [6j](#6j-cronjob-running-a-task-on-a-schedule)). Still to do: run it, and use a real task (for example a database cleanup).
 - [x] **Ingress**: `/api` to the backend and `/` to the frontend through ingress-nginx (done, see [6k](#6k-ingress-one-entry-point-for-frontend-and-backend)).
 - [x] **Autoscaling**: HPA for the frontend written (see [6l](#6l-horizontalpodautoscaler-scaling-the-frontend-on-cpu)). Still to do: generate load and watch it scale up and back down.
+- [x] **ServiceAccount**: `backend-service-account` written (see [6m](#6m-serviceaccount-an-identity-for-the-backend-pods)). Still to do: add `serviceAccountName` to the backend Deployment, apply it, and learn Role / RoleBinding (RBAC).
 - [ ] Add a `.dockerignore`, and production-style images (no dev server).
 - [x] Health checks (startup / readiness / liveness probes) written and added to the backend Deployment (see [6h](#6h-health-probes-startup-readiness-liveness)). Still to do: confirm they pass on the cluster, lengthen the startup window and catch the startup error.
 - [ ] Fix the env variable name mismatch between `db.js`, `migrate.js` and the Pod YAML.
